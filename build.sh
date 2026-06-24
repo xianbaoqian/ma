@@ -12,10 +12,18 @@
 #
 # Deploying to your own folders: if a file called `deploy.conf` sits next to this script,
 # every folder listed in it gets a fresh copy of `ma` at the end of the build. One line
-# per folder, '#' for comments, `~` is allowed. This file is gitignored, so your personal
-# paths never end up in the repo.
+# per folder, lines starting with '#' for comments, `~` is allowed. This file is
+# gitignored, so your personal paths never end up in the repo.
 set -e
 cd "$(dirname "$0")"
+
+expand_path() {
+  case "$1" in
+    '~')    printf '%s\n' "$HOME" ;;
+    '~/'*)  printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+    *)      printf '%s\n' "$1" ;;
+  esac
+}
 
 # --- make sure zig is here, with a clear message if it isn't ---
 if ! command -v zig >/dev/null 2>&1; then
@@ -26,8 +34,9 @@ fi
 
 # --- 1. cross-compile the same source once per platform, into a throwaway dir ---
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-echo "Building three native engines from launcher.zig ..."
+echo "Building four native engines from launcher.zig ..."
 zig build-exe launcher.zig -femit-bin="$tmp/ma-MACARM"   -target aarch64-macos -O ReleaseSmall
+zig build-exe launcher.zig -femit-bin="$tmp/ma-MACX86"   -target x86_64-macos  -O ReleaseSmall
 zig build-exe launcher.zig -femit-bin="$tmp/ma-LINUXARM" -target aarch64-linux -O ReleaseSmall
 zig build-exe launcher.zig -femit-bin="$tmp/ma-LINUXX86" -target x86_64-linux  -O ReleaseSmall
 
@@ -36,7 +45,7 @@ zig build-exe launcher.zig -femit-bin="$tmp/ma-LINUXX86" -target x86_64-linux  -
 # machine — not now, during the build.)
 cat > ma <<'WRAP'
 #!/bin/sh
-# This file is a shell script with three native programs hidden inside it. A mac program
+# This file is a shell script with four native programs hidden inside it. A mac program
 # and a Linux program are genuinely different files and can't be the same bytes, so this
 # file isn't a program at all — it's a recipe that both systems know how to read. When you
 # run it, the recipe checks which system you're on, peels off the matching program, and
@@ -44,6 +53,7 @@ cat > ma <<'WRAP'
 set -e
 case "$(uname)-$(uname -m)" in
   Darwin-arm64)  tag=MACARM ;;
+  Darwin-x86_64) tag=MACX86 ;;
   Linux-aarch64) tag=LINUXARM ;;
   Linux-x86_64)  tag=LINUXX86 ;;
   *) echo "ma: no built-in engine for $(uname)-$(uname -m)" >&2; exit 1 ;;
@@ -68,18 +78,18 @@ MA_HOME="$home" MA_ARGV0="$0" exec "$bin" "$@"
 WRAP
 
 # --- 3. base64-encode each engine and staple it onto the end, between markers ---
-for tag in MACARM LINUXARM LINUXX86; do
+for tag in MACARM MACX86 LINUXARM LINUXX86; do
   echo "#${tag}_BEGIN"; base64 < "$tmp/ma-$tag"; echo "#${tag}_END"
 done >> ma
 chmod +x ma
-echo "Built ./ma ($(wc -c < ma) bytes) — mac-arm64 + linux-arm64 + linux-x86_64."
+echo "Built ./ma ($(wc -c < ma) bytes) — mac-arm64 + mac-x86_64 + linux-arm64 + linux-x86_64."
 
 # --- 4. optional: copy the fresh ma into your own account folders ---
 if [ -f deploy.conf ]; then
   echo "Deploying to the folders in deploy.conf ..."
-  while IFS= read -r line; do
+  while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|\#*) continue ;; esac      # skip blanks and comments
-    dir="$(eval echo "$line")"                     # allow ~ to expand
+    dir="$(expand_path "$line")"                   # allow ~ to expand
     if [ -d "$dir" ]; then
       cp ma "$dir/ma" && chmod +x "$dir/ma"
       echo "  -> $dir/ma"

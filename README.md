@@ -18,10 +18,12 @@ back up, or delete with `rm`. The whole idea fits in one sentence:
 There are several good multi-account tools already. `ma` is different in two ways that
 might matter to you:
 
-1. **It's a single file that runs everywhere, with nothing to install.** Not an npm package,
-   not a per-OS download, not a script you have to source. One `ma` file runs on macOS,
-   Linux, and Windows (through WSL). Copy it to a new machine and it just works. (The trick
-   that makes this possible is explained near the bottom — it's genuinely interesting.)
+1. **It's one small file that runs everywhere supported, with nothing to install.** Not an
+   npm package, not a per-OS download, not a script you have to source. One roughly
+   megabyte-sized `ma` file carries the native engines for Apple Silicon Macs, Intel Macs,
+   Linux ARM, and Linux x86_64, squeezed together behind the same command. Copy the same
+   file to a new machine and it just works. (The trick that makes this possible is
+   explained near the bottom — it's genuinely interesting.)
 
 2. **Everything is local and visible.** Nothing is written to `~/.config` or a registry.
    The accounts live in the folder you choose, named so you can read them at a glance, and
@@ -36,7 +38,9 @@ one, then:
 ./install.sh ~/ai-accounts        # set up a folder to hold your accounts
 ```
 
-That prints one `alias` line to add to your shell. After that, from anywhere:
+That copies `ma` into the account folder, writes a starter `programs.conf` if needed,
+registers that folder in local `deploy.conf` for future builds, and prints one `alias`
+line to add to your shell. After that, from anywhere:
 
 ```sh
 ma new claude work                # create an isolated "work" account for claude
@@ -100,15 +104,16 @@ tool — it's how the two systems work.
 
 `ma` sidesteps this by **not being a program at all.** It's a shell script — a recipe —
 and a recipe is something *both* systems already know how to read. Stapled invisibly to the
-end of that recipe are the real programs: one built for macOS, one for Linux on Apple-style
-chips, one for Linux on Intel-style chips. When you run `ma`, the recipe looks at which
-system and chip you're on, peels off the matching program into the same folder, and runs it.
+end of that recipe are the real programs: one built for Apple Silicon Macs, one for Intel
+Macs, one for Linux on ARM chips, and one for Linux on x86_64 chips. When you run `ma`, the
+recipe looks at which system and chip you're on, peels off the matching program into the
+same folder, and runs it.
 
-So the magic isn't "one program that runs everywhere." It's "a note that every system can
-read, carrying the right program for each system inside it, handing over the correct one on
-the spot." The first time you run `ma` on a machine, it leaves the unpacked program sitting
-right next to itself (named like `ma-MACARM`) so you can see exactly what ran — and so it
-doesn't have to unpack again.
+So the magic isn't "one native program format that every OS agrees on." It's one uniform
+file that every supported system can start, carrying the right native program for each
+system inside it, handing over to the correct one on the spot. The first time you run `ma`
+on a machine, it leaves the unpacked program sitting right next to itself (named like
+`ma-MACARM`) so you can see exactly what ran — and so it doesn't have to unpack again.
 
 This idea has a famous, more powerful cousin called **Cosmopolitan / APE**, which does the
 same thing at a deeper level and even covers native Windows. `ma` uses the simple version
@@ -134,10 +139,14 @@ You need [zig 0.16](https://ziglang.org/download/). Then:
 ./build.sh
 ```
 
-That cross-compiles the engine for all three platforms and assembles them into a single
-`ma`. You don't need a Linux machine to build the Linux versions — zig does it all from one
-box. If you keep accounts in several folders, list those folders in `deploy.conf` (one per
-line) and `build.sh` will drop the fresh `ma` into each one automatically.
+That cross-compiles the engine for four targets — macOS ARM, macOS x86_64, Linux ARM, and
+Linux x86_64 — and squeezes them into one small `ma` file. You don't need a Linux machine
+to build the Linux versions — zig does it all from one box. If local `deploy.conf` exists,
+`build.sh` also drops the fresh `ma` into every folder listed there. `install.sh` adds its
+install target to that file automatically; edit `deploy.conf` by hand only when you want to
+add, remove, or comment out extra deployment folders. There is no separate `deploy.sh`;
+deployment is just the final optional step of `build.sh`. The file is ignored by git
+because it contains personal machine paths.
 
 ## Where your logins live, and git
 
