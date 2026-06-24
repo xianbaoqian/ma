@@ -245,6 +245,28 @@ fn cmdLs(programs: []Program) void {
     if (!any) out("no accounts yet. create one with:  ./ma new PROGRAM ACCOUNT\n", .{});
 }
 
+const PsCtx = struct { prog: *const Program, cwd: []const u8, rows: *std.ArrayList(resume_mod.PsRow) };
+
+/// Add one account folder's current-project sessions to a `ma PROGRAM ps` listing.
+/// Example: "claude-1-work" contributes rows from its .claude/projects/<cwd>/ directory.
+fn psRow(ctx: *PsCtx, name: []const u8, p: Parsed) void {
+    resume_mod.ps(.{ .io = io, .gpa = gpa, .env = env, .install_root = root }, ctx.prog, join(&.{ root, name }), p.account, ctx.cwd, ctx.rows);
+}
+
+/// List all sessions for this current folder across the program's account folders.
+/// Example: cmdPs("claude") implements `ma claude ps`.
+fn cmdPs(programs: []Program, progname: []const u8) void {
+    const prog = manifest_mod.find(programs, progname) orelse
+        fail("unknown program '{s}' (known: {s})", .{ progname, manifest_mod.knownList(manifestContext(), programs) });
+    if (!resume_mod.supports(prog.name)) fail("'{s} ps' is not supported", .{prog.name});
+    const cwd = std.process.currentPathAlloc(io, gpa) catch |e|
+        fail("cannot read current directory: {s}", .{@errorName(e)});
+    var rows: std.ArrayList(resume_mod.PsRow) = .empty;
+    var ctx = PsCtx{ .prog = prog, .cwd = cwd, .rows = &rows };
+    manifest_mod.forEachAccount(manifestContext(), programs, prog, &ctx, psRow);
+    resume_mod.printPs(.{ .io = io, .gpa = gpa, .env = env, .install_root = root }, prog.name, cwd, rows.items);
+}
+
 /// Print command usage and the manifest's known programs.
 /// Example: usage(programs) prints "ma new PROGRAM ACCOUNT" and "claude, codex, ...".
 fn usage(programs: []Program) void {
@@ -253,6 +275,7 @@ fn usage(programs: []Program) void {
         \\
         \\  ./ma new PROGRAM ACCOUNT      create an isolated account folder
         \\  ./ma PROGRAM NAME|ID [args]   launch an account (args pass through)
+        \\  ./ma PROGRAM ps               list sessions for the current folder
         \\  ./ma ls                       list accounts and login state
         \\  ./PROGRAM-ID-ACCOUNT/PROGRAM  launch directly (named after the program)
         \\
@@ -274,6 +297,10 @@ fn dispatch(programs: []Program, args: [][]const u8) void {
         return cmdNew(programs, args[2], args[3]);
     }
     if (args.len < 3) fail("usage: ma PROGRAM NAME|ID [args...]", .{});
+    if (std.mem.eql(u8, args[2], "ps")) {
+        if (args.len != 3) fail("usage: ma PROGRAM ps", .{});
+        return cmdPs(programs, args[1]);
+    }
     cmdRun(programs, args[1], args[2], args[3..]);
 }
 

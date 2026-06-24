@@ -31,23 +31,39 @@ might matter to you:
    The accounts live in the folder you choose, named so you can read them at a glance, and
    the only "state" is the folder names themselves. You can audit the whole thing by looking.
 
-## Getting started
+## Download and install
 
-You need the single `ma` file. Either build it (see *Building* below) or grab a prebuilt
-one, then:
+The repository already includes a ready-to-run `ma` file for supported Unix-like platforms:
+Apple Silicon macOS, Intel macOS, Linux ARM64, and Linux x86_64. Clone it and run the
+included installer:
 
 ```sh
-./install.sh ~/ai-accounts        # set up a folder to hold your accounts
+git clone https://github.com/xianbaoqian/ma
+cd ma
+./install.sh ~/ai-accounts        # choose where account folders should live
 ```
 
-That copies `ma` into the account folder, writes a starter `programs.conf` if needed,
-registers that folder in local `deploy.conf` for future builds, and prints one `alias`
-line to add to your shell. After that, from anywhere:
+The installer copies that `ma` file into your account folder, writes a starter
+`programs.conf` if needed, and prints one `alias` line to add to your shell.
+
+If your platform is not one of the bundled targets, or you want to rebuild the bundled
+binary yourself, use `./build.sh` first and then run `./install.sh`.
+
+## Getting started
+
+After installation, from anywhere:
 
 ```sh
 ma new claude work                # create an isolated "work" account for claude
 ma claude work                    # use it — anytime, from any project directory
 ma ls                             # list every account and whether it's logged in
+```
+
+If you are working directly from the cloned repository without installing yet, you can also
+run the bundled file in place:
+
+```sh
+./ma ls
 ```
 
 Everything you type after the account name is passed straight through to the real tool, so
@@ -99,7 +115,22 @@ sidecar folder when there is one, and moves the matching `history.jsonl` rows to
 anything else and nothing is moved.
 
 This works for Claude and Codex. It checks nested session paths, so the session does not
-have to be directly under `.claude/` or `.codex/`.
+have to be directly under `.claude/` or `.codex/`. opencode sessions live in its SQLite
+database, so `ma` does not move rows; it detects when `-s`/`--session` points at another
+account and tells you which account owns it.
+
+## Sessions in this folder
+
+Use `ps` after the program name to see sessions for the current project directory:
+
+```sh
+ma claude ps
+ma codex ps
+ma opencode ps
+```
+
+The table shows the account, session id, last seen time, start time, duration, and topic.
+For opencode, `ma` asks `opencode db --format tsv` under each account's environment.
 
 ## The commands
 
@@ -108,6 +139,7 @@ have to be directly under `.claude/` or `.codex/`.
 | `ma new PROGRAM ACCOUNT` | create a new isolated account folder |
 | `ma PROGRAM NAME` | run that account (everything after is passed through) |
 | `ma PROGRAM ID` | same, but pick the account by its number |
+| `ma PROGRAM ps` | list this folder's Claude, Codex, or opencode sessions |
 | `ma ls` | list all accounts and their login state |
 | `ma help` | usage |
 

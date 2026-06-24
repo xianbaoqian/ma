@@ -73,6 +73,9 @@ CLAUDE_ID=11111111-2222-4333-8444-555555555555
 CLAUDE_ENV_ID=22222222-3333-4444-8555-666666666666
 CODEX_ID=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
 DECLINE_ID=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff
+PS_ID_OLD=33333333-4444-4555-8666-777777777777
+PS_ID_NEW=44444444-5555-4666-8777-888888888888
+CODEX_PS_ID=55555555-6666-4777-8888-999999999999
 
 trap 'rm -rf "$ROOT"' EXIT INT HUP TERM
 
@@ -205,5 +208,42 @@ assert_grep "$LOG" "CLAUDE_CONFIG_DIR=$ROOT/claude-2-中文/.claude"
 assert_grep "$LOG" "args=ping"
 assert_grep "$CASE/list.out" "claude-2-中文"
 say "supports non-ASCII account names"
+
+PROJECT_DIR="$CASE/project"
+PROJECT_KEY="$(printf '%s' "$PROJECT_DIR" | tr '/' '-')"
+mkdir -p "$PROJECT_DIR" \
+  "$ROOT/claude-1-cn/.claude/projects/$PROJECT_KEY" \
+  "$ROOT/claude-2-中文/.claude/projects/$PROJECT_KEY"
+cat > "$ROOT/claude-1-cn/.claude/projects/$PROJECT_KEY/$PS_ID_OLD.jsonl" <<EOF2
+{"type":"user","timestamp":"2026-06-24T10:00:00.000Z","message":{"content":"older topic"}}
+{"type":"assistant","timestamp":"2026-06-24T10:05:30.000Z","message":{"content":"older reply"}}
+EOF2
+cat > "$ROOT/claude-2-中文/.claude/projects/$PROJECT_KEY/$PS_ID_NEW.jsonl" <<EOF2
+{"type":"user","timestamp":"2026-06-24T11:00:00.000Z","message":{"content":[{"type":"text","text":"newer topic from array"}]}}
+{"type":"summary","timestamp":"2026-06-24T11:15:00.000Z","summary":"newer summary"}
+EOF2
+mkdir -p "$ROOT/codex-2-cn/.codex/sessions/2026/06/24"
+cat > "$ROOT/codex-2-cn/.codex/sessions/2026/06/24/rollout-2026-06-24T12-00-00-$CODEX_PS_ID.jsonl" <<EOF2
+{"timestamp":"2026-06-24T12:00:00.000Z","type":"session_meta","payload":{"session_id":"$CODEX_PS_ID","cwd":"$PROJECT_DIR"}}
+{"timestamp":"2026-06-24T12:01:00.000Z","type":"user_message","payload":{"text":"codex ps topic"}}
+{"timestamp":"2026-06-24T12:04:00.000Z","type":"agent_message","payload":{"text":"codex ps reply"}}
+EOF2
+(cd "$PROJECT_DIR" && run_ma claude ps) > "$CASE/claude-ps.out"
+(cd "$PROJECT_DIR" && run_ma codex ps) > "$CASE/codex-ps.out"
+
+assert_grep "$CASE/claude-ps.out" "ACCOUNT"
+assert_grep "$CASE/claude-ps.out" "$PS_ID_OLD"
+assert_grep "$CASE/claude-ps.out" "$PS_ID_NEW"
+assert_grep "$CASE/claude-ps.out" "cn"
+assert_grep "$CASE/claude-ps.out" "中文"
+assert_grep "$CASE/claude-ps.out" "2026-06-24 11:15Z"
+assert_grep "$CASE/claude-ps.out" "15m00s"
+assert_grep "$CASE/claude-ps.out" "newer summary"
+first_session="$(awk 'NR==2 {print $2}' "$CASE/claude-ps.out")"
+test "$first_session" = "$PS_ID_NEW" || die "expected newest session first, got $first_session"
+assert_grep "$CASE/codex-ps.out" "$CODEX_PS_ID"
+assert_grep "$CASE/codex-ps.out" "codex ps topic"
+assert_grep "$CASE/codex-ps.out" "4m00s"
+say "lists current-folder sessions across Claude and Codex accounts"
 
 echo "all tests passed"
