@@ -1,5 +1,7 @@
 # ma — run many isolated accounts of your AI CLIs, side by side
 
+[中文说明](README.zh-CN.md)
+
 If you have more than one account for tools like `claude`, `codex`, `kimi`, or `opencode`,
 they normally fight over the same hidden config folder in your home directory (`~/.claude`,
 `~/.codex`, …). Log into one and you've logged out of the other.
@@ -44,13 +46,60 @@ line to add to your shell. After that, from anywhere:
 
 ```sh
 ma new claude work                # create an isolated "work" account for claude
-ma claude work /login             # log in once (the login lands inside the folder)
 ma claude work                    # use it — anytime, from any project directory
 ma ls                             # list every account and whether it's logged in
 ```
 
 Everything you type after the account name is passed straight through to the real tool, so
 `ma claude work --resume` does exactly what `claude --resume` would, just for that account.
+
+## Alias or symlink?
+
+Use the alias printed by `install.sh`:
+
+```sh
+alias ma="$HOME/ai-accounts/ma"
+```
+
+That is the clearest setup: the `ma` file stays inside the account root, next to
+`programs.conf` and all account folders.
+
+A symlink from a directory on your `PATH` also works:
+
+```sh
+ln -s "$HOME/ai-accounts/ma" "$HOME/bin/ma"
+```
+
+The wrapper follows that symlink back to the real file, so it still finds
+`$HOME/ai-accounts/programs.conf`.
+
+Do not copy `ma` into `~/bin` as a standalone file. A copied `~/bin/ma` thinks `~/bin` is
+the account root, so it looks for `~/bin/programs.conf` and creates accounts there. If you
+want a `PATH` command, symlink to the installed `ma` instead of copying it.
+
+## Resume from the wrong account
+
+Sometimes you remember the session id, but not which account created it:
+
+```sh
+ma claude work --resume fbfdb307-0866-4923-9e77-8a2a4274086e
+```
+
+If that session is not in `work`, `ma` now checks the other folders for the same program.
+If it finds exactly one match, it tells you where it found it and asks before moving
+anything:
+
+```text
+ma: claude session ... is in claude-2-personal, not account 'work'
+ma: move it into 'work'? [y/N]
+```
+
+Answer `y` and `ma` moves the session file into the account you asked to use, moves Claude's
+sidecar folder when there is one, and moves the matching `history.jsonl` rows too. Answer
+anything else and nothing is moved.
+
+This works for Claude and Codex. It checks nested session paths, so the session does not
+have to be directly under `.claude/` or `.codex/`.
 
 ## The commands
 
@@ -139,14 +188,25 @@ You need [zig 0.16](https://ziglang.org/download/). Then:
 ./build.sh
 ```
 
-That cross-compiles the engine for four targets — macOS ARM, macOS x86_64, Linux ARM, and
-Linux x86_64 — and squeezes them into one small `ma` file. You don't need a Linux machine
-to build the Linux versions — zig does it all from one box. If local `deploy.conf` exists,
-`build.sh` also drops the fresh `ma` into every folder listed there. `install.sh` adds its
-install target to that file automatically; edit `deploy.conf` by hand only when you want to
-add, remove, or comment out extra deployment folders. There is no separate `deploy.sh`;
-deployment is just the final optional step of `build.sh`. The file is ignored by git
-because it contains personal machine paths.
+That runs the regression tests, then cross-compiles the engine for four targets — macOS ARM,
+macOS x86_64, Linux ARM, and Linux x86_64 — and squeezes them into one small `ma` file. You
+don't need a Linux machine to build the Linux versions — zig does it all from one box. If
+local `deploy.conf` exists, `build.sh` also drops the fresh `ma` into every folder listed
+there. `install.sh` adds its install target to that file automatically; edit `deploy.conf`
+by hand only when you want to add, remove, or comment out extra deployment folders. There
+is no separate `deploy.sh`; deployment is just the final optional step of `build.sh`. The
+file is ignored by git because it contains personal machine paths.
+
+The source lives in `src/`. For a faster behavior check without the cross-platform package
+step, run:
+
+```sh
+./test.sh
+```
+
+The test builds a temporary `ma`, creates fake `claude` and `codex` binaries, and verifies
+account creation, resume-session adoption, `history.jsonl` movement, decline behavior, and
+non-ASCII account names.
 
 ## Where your logins live, and git
 

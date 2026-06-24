@@ -12,6 +12,8 @@
 set -e
 cd "$(dirname "$0")"
 
+# Expand an install target path without invoking the shell on user data.
+# Example: expand_path "~/ai-accounts" prints "$HOME/ai-accounts".
 expand_path() {
   case "$1" in
     '~')    printf '%s\n' "$HOME" ;;
@@ -20,6 +22,8 @@ expand_path() {
   esac
 }
 
+# Add the install target to deploy.conf if it is not already present.
+# Example: with dest=/Users/me/ai-accounts, appends that path for future ./build.sh deploys.
 register_deploy_target() {
   deploy_conf=deploy.conf
   found=0
@@ -93,5 +97,5 @@ echo "    alias ma='$dest/ma'"
 echo
 echo "Then start a new shell and try:"
 echo "    ma new claude work     # make an isolated 'work' account for claude"
-echo "    ma claude work         # run it (after you log in once)"
+echo "    ma claude work         # run that account"
 echo "    ma ls                  # see all your accounts"

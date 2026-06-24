@@ -17,6 +17,8 @@
 set -e
 cd "$(dirname "$0")"
 
+# Expand a deploy.conf path without invoking the shell on user data.
+# Example: expand_path "~/projects/private-accounts" prints "$HOME/projects/private-accounts".
 expand_path() {
   case "$1" in
     '~')    printf '%s\n' "$HOME" ;;
@@ -32,13 +34,18 @@ if ! command -v zig >/dev/null 2>&1; then
   exit 1
 fi
 
+echo "Running tests ..."
+./test.sh
+
 # --- 1. cross-compile the same source once per platform, into a throwaway dir ---
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-echo "Building four native engines from launcher.zig ..."
-zig build-exe launcher.zig -femit-bin="$tmp/ma-MACARM"   -target aarch64-macos -O ReleaseSmall
-zig build-exe launcher.zig -femit-bin="$tmp/ma-MACX86"   -target x86_64-macos  -O ReleaseSmall
-zig build-exe launcher.zig -femit-bin="$tmp/ma-LINUXARM" -target aarch64-linux -O ReleaseSmall
-zig build-exe launcher.zig -femit-bin="$tmp/ma-LINUXX86" -target x86_64-linux  -O ReleaseSmall
+export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$tmp/zig-global}"
+export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$tmp/zig-local}"
+echo "Building four native engines from src/launcher.zig ..."
+zig build-exe src/launcher.zig -femit-bin="$tmp/ma-MACARM"   -target aarch64-macos -O ReleaseSmall
+zig build-exe src/launcher.zig -femit-bin="$tmp/ma-MACX86"   -target x86_64-macos  -O ReleaseSmall
+zig build-exe src/launcher.zig -femit-bin="$tmp/ma-LINUXARM" -target aarch64-linux -O ReleaseSmall
+zig build-exe src/launcher.zig -femit-bin="$tmp/ma-LINUXX86" -target x86_64-linux  -O ReleaseSmall
 
 # --- 2. write the little shell "recipe" that picks the right engine at run time ---
 # (Quoted heredoc: everything below is stored literally and only runs later, on the user's
@@ -87,14 +94,22 @@ echo "Built ./ma ($(wc -c < ma) bytes) — mac-arm64 + mac-x86_64 + linux-arm64 
 # --- 4. optional: copy the fresh ma into your own account folders ---
 if [ -f deploy.conf ]; then
   echo "Deploying to the folders in deploy.conf ..."
+  deploy_failed=0
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|\#*) continue ;; esac      # skip blanks and comments
     dir="$(expand_path "$line")"                   # allow ~ to expand
     if [ -d "$dir" ]; then
-      cp ma "$dir/ma" && chmod +x "$dir/ma"
-      echo "  -> $dir/ma"
+      if cp ma "$dir/ma" && chmod +x "$dir/ma"; then
+        echo "  -> $dir/ma"
+      else
+        echo "  !! failed: $dir/ma" >&2
+        deploy_failed=1
+      fi
     else
       echo "  !! skipped (no such folder): $dir" >&2
     fi
   done < deploy.conf
+  if [ "$deploy_failed" -ne 0 ]; then
+    exit 1
+  fi
 fi

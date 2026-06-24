@@ -18,8 +18,13 @@
 !/.gitignore
 !/LICENSE
 !/README.md
-!/launcher.zig
+!/README.zh-CN.md
+!/src/
+!/src/launcher.zig
+!/src/manifest.zig
+!/src/resume.zig
 !/build.sh
 !/install.sh
+!/test.sh
 !/programs.conf
 !/ma

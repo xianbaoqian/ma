@@ -16,31 +16,36 @@
 // stderr with a precise line and a non-zero exit. Standard library only (Zig 0.16 Io API).
 
 const std = @import("std");
+const manifest_mod = @import("manifest.zig");
+const resume_mod = @import("resume.zig");
 const Io = std.Io;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 const path = std.fs.path;
 
-const Pair = struct { name: []const u8, dir: []const u8 };
-const Program = struct { name: []const u8, binary: []const u8, pairs: []Pair };
-const Parsed = struct { program: *const Program, id: u32, account: []const u8 };
+const Program = manifest_mod.Program;
+const Parsed = manifest_mod.Parsed;
 
 // Globals set once in main, so helpers stay K&R-short instead of threading them everywhere.
 var io: Io = undefined;
 var gpa: Allocator = undefined;
 var env: *std.process.Environ.Map = undefined;
 // Install dir: where `ma` and programs.conf live. Account folders live here too, so the
-// add-ons work from any cwd (e.g. when `ma` is aliased). Set once in loadManifest.
+// add-ons work from any cwd (e.g. when `ma` is aliased). Set once in main.
 var root: []const u8 = undefined;
 
 // ---- output / failure (write straight to fd 1/2; immune to std.io churn) ----
 
+/// Write formatted text to stdout.
+/// Example: out("created {s}\n", .{"claude-1-work"}) prints "created claude-1-work".
 fn out(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
     std.Io.File.stdout().writeStreamingAll(io, s) catch {};
 }
 
+/// Print a formatted ma-prefixed error to stderr and exit with status 1.
+/// Example: fail("unknown program '{s}'", .{"foo"}) prints "ma: unknown program 'foo'".
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [4096]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "ma: " ++ fmt ++ "\n", args) catch "ma: error\n";
@@ -48,103 +53,28 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
+/// Join path fragments with the platform separator.
+/// Example: join(&.{ "/tmp/accts", "claude-1-work", ".claude" }) returns that path joined.
 fn join(parts: []const []const u8) []const u8 {
     return path.join(gpa, parts) catch fail("out of memory", .{});
 }
 
-// Canonical absolute path: resolve "." and ".." against cwd so the folder's
-// basename is always the real PROGRAM-ID-ACCOUNT name (e.g. "." -> the cwd's name).
+/// Resolve a possibly relative path into a canonical absolute path.
+/// Example: from /repo, absolutize("./claude-1-work") returns "/repo/claude-1-work".
 fn absolutize(p: []const u8) []const u8 {
     const cwd = std.process.currentPathAlloc(io, gpa) catch |e|
         fail("cannot read current directory: {s}", .{@errorName(e)});
     return path.resolve(gpa, &.{ cwd, p }) catch fail("out of memory", .{});
 }
 
-// ---- manifest ----
-
-fn loadManifest() []Program {
-    // MA_HOME, when set by the cross-platform polyglot wrapper, is the real install dir.
-    // Without it (native binary run directly) we self-locate from our own exec path.
-    root = if (env.get("MA_HOME")) |h| (gpa.dupe(u8, h) catch fail("out of memory", .{})) else std.process.executableDirPathAlloc(io, gpa) catch |e|
-        fail("cannot find own path: {s}", .{@errorName(e)});
-    const file = join(&.{ root, "programs.conf" });
-    const data = Dir.cwd().readFileAlloc(io, file, gpa, .limited(1 << 20)) catch |e|
-        fail("cannot read manifest '{s}': {s}", .{ file, @errorName(e) });
-
-    var list: std.ArrayList(Program) = .empty;
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
-
-        var fields = std.mem.splitScalar(u8, line, '|');
-        const name = std.mem.trim(u8, fields.next() orelse continue, " \t");
-        const binary = std.mem.trim(u8, fields.next() orelse
-            fail("manifest line missing binary: '{s}'", .{line}), " \t");
-        const pairs_field = std.mem.trim(u8, fields.next() orelse
-            fail("manifest line missing VAR=dir pairs: '{s}'", .{line}), " \t");
-        if (name.len == 0 or binary.len == 0)
-            fail("manifest line has empty name or binary: '{s}'", .{line});
-
-        var pairs: std.ArrayList(Pair) = .empty;
-        var toks = std.mem.tokenizeScalar(u8, pairs_field, ' ');
-        while (toks.next()) |tok| {
-            const eq = std.mem.indexOfScalar(u8, tok, '=') orelse
-                fail("manifest pair '{s}' is not VAR=dir (line: '{s}')", .{ tok, line });
-            if (eq == 0 or eq == tok.len - 1)
-                fail("manifest pair '{s}' has empty side (line: '{s}')", .{ tok, line });
-            pairs.append(gpa, .{ .name = tok[0..eq], .dir = tok[eq + 1 ..] }) catch
-                fail("out of memory", .{});
-        }
-        if (pairs.items.len == 0) fail("program '{s}' has no VAR=dir pairs", .{name});
-
-        list.append(gpa, .{
-            .name = name,
-            .binary = binary,
-            .pairs = pairs.toOwnedSlice(gpa) catch fail("out of memory", .{}),
-        }) catch fail("out of memory", .{});
-    }
-    if (list.items.len == 0) fail("manifest is empty", .{});
-    return list.toOwnedSlice(gpa) catch fail("out of memory", .{});
+/// Build the manifest module context from launcher globals.
+/// Example: if root is "/accounts", this returns a context whose root is "/accounts".
+fn manifestContext() manifest_mod.Context {
+    return .{ .io = io, .gpa = gpa, .root = root };
 }
 
-fn findProgram(programs: []Program, name: []const u8) ?*Program {
-    for (programs) |*p| if (std.mem.eql(u8, p.name, name)) return p;
-    return null;
-}
-
-fn knownList(programs: []Program) []const u8 {
-    var b: std.ArrayList(u8) = .empty;
-    for (programs, 0..) |p, i| {
-        if (i != 0) b.appendSlice(gpa, ", ") catch return "";
-        b.appendSlice(gpa, p.name) catch return "";
-    }
-    return b.toOwnedSlice(gpa) catch "";
-}
-
-// PROGRAM = longest manifest entry that is a prefix followed by '-';
-// ID = next '-'-segment, must be a base-10 integer; ACCOUNT = the remainder.
-fn parse(programs: []Program, name: []const u8) Parsed {
-    var best: ?*Program = null;
-    for (programs) |*p| {
-        if (name.len > p.name.len and std.mem.startsWith(u8, name, p.name) and name[p.name.len] == '-') {
-            if (best == null or p.name.len > best.?.name.len) best = p;
-        }
-    }
-    const p = best orelse
-        fail("folder '{s}': no known program prefix (known: {s})", .{ name, knownList(programs) });
-
-    const rest = name[p.name.len + 1 ..];
-    const dash = std.mem.indexOfScalar(u8, rest, '-') orelse
-        fail("folder '{s}': expected PROGRAM-ID-ACCOUNT", .{name});
-    const id = std.fmt.parseInt(u32, rest[0..dash], 10) catch
-        fail("folder '{s}': id '{s}' is not an integer", .{ name, rest[0..dash] });
-    const account = rest[dash + 1 ..];
-    if (account.len == 0) fail("folder '{s}': empty account name", .{name});
-    return .{ .program = p, .id = id, .account = account };
-}
-
-// PATH search, skipping the account folder so we never re-exec our own symlink.
+/// Search PATH for a real executable, ignoring the current account folder.
+/// Example: which("claude", "/accounts/claude-1-work") returns "/usr/local/bin/claude".
 fn which(binary: []const u8, skip_dir: []const u8) ?[]const u8 {
     const p = env.get("PATH") orelse return null;
     var it = std.mem.splitScalar(u8, p, ':');
@@ -157,8 +87,8 @@ fn which(binary: []const u8, skip_dir: []const u8) ?[]const u8 {
     return null;
 }
 
-// Replace this process image with argv (argv[0] must be an absolute/relative path,
-// not a bare name, so PATH is not consulted). Never returns on success.
+/// Replace this process image with argv; argv[0] must be a path, not a bare command.
+/// Example: exec(&.{"/usr/bin/env", "bash"}) never returns if /usr/bin/env starts.
 fn exec(argv: []const []const u8) noreturn {
     const e = std.process.replace(io, .{ .argv = argv, .environ_map = env });
     fail("exec '{s}' failed: {s}", .{ argv[0], @errorName(e) });
@@ -166,6 +96,8 @@ fn exec(argv: []const []const u8) noreturn {
 
 // ---- KERNEL ----
 
+/// Launch one account by deriving PROGRAM-ID-ACCOUNT from the symlink path.
+/// Example: argv0="/accounts/claude-1-work/claude" sets CLAUDE_CONFIG_DIR and execs claude.
 fn launch(programs: []Program, args: [][]const u8, argv0: []const u8, arg0base: []const u8) noreturn {
     if (std.mem.indexOfScalar(u8, argv0, '/') == null)
         fail("run the account launcher by path, e.g. ./claude-1-thorson/{s}", .{arg0base});
@@ -173,9 +105,12 @@ fn launch(programs: []Program, args: [][]const u8, argv0: []const u8, arg0base: 
     const folder = absolutize(path.dirname(argv0).?);
     const fname = path.basename(folder);
 
-    const p = parse(programs, fname);
+    const p = manifest_mod.parse(manifestContext(), programs, fname);
     if (!std.mem.eql(u8, arg0base, p.program.name))
         fail("launcher '{s}' in folder '{s}' should be named '{s}'", .{ arg0base, fname, p.program.name });
+
+    if (resume_mod.supports(p.program.name))
+        resume_mod.maybeAdopt(.{ .io = io, .gpa = gpa, .env = env, .install_root = root }, p.program, p.account, folder, args);
 
     for (p.program.pairs) |pair|
         env.put(pair.name, join(&.{ folder, pair.dir })) catch fail("out of memory", .{});
@@ -191,36 +126,25 @@ fn launch(programs: []Program, args: [][]const u8, argv0: []const u8, arg0base: 
 
 // ---- ADD-ONS ----
 
-// Visit every account folder for one program in the install dir.
-fn forEachAccount(programs: []Program, prog: *const Program, ctx: anytype, comptime f: fn (@TypeOf(ctx), []const u8, Parsed) void) void {
-    var dir = Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |e|
-        fail("cannot open install dir '{s}': {s}", .{ root, @errorName(e) });
-    var it = dir.iterate();
-    while (it.next(io) catch |e| fail("cannot scan directory: {s}", .{@errorName(e)})) |entry| {
-        if (entry.kind != .directory) continue;
-        if (!std.mem.startsWith(u8, entry.name, prog.name)) continue;
-        if (entry.name.len <= prog.name.len or entry.name[prog.name.len] != '-') continue;
-        const p = parse(programs, entry.name);
-        if (p.program != prog) continue;
-        f(ctx, entry.name, p);
-    }
-}
-
 const RunFind = struct { key: []const u8, key_id: ?u32, matches: *std.ArrayList([]const u8) };
 
+/// Record account folders that match a requested account name or numeric id.
+/// Example: key="work" records "claude-1-work"; key_id=1 records account id 1.
 fn collectRun(ctx: *RunFind, name: []const u8, p: Parsed) void {
     const hit = if (ctx.key_id) |k| p.id == k else std.mem.eql(u8, p.account, ctx.key);
     if (hit) ctx.matches.append(gpa, gpa.dupe(u8, name) catch fail("out of memory", .{})) catch
         fail("out of memory", .{});
 }
 
+/// Resolve `ma PROGRAM NAME|ID [args...]` into an account launcher and exec it.
+/// Example: cmdRun("claude", "work", &.{"--resume", uuid}) execs claude-1-work/claude.
 fn cmdRun(programs: []Program, progname: []const u8, key: []const u8, rest: [][]const u8) noreturn {
-    const prog = findProgram(programs, progname) orelse
-        fail("unknown program '{s}' (known: {s})", .{ progname, knownList(programs) });
+    const prog = manifest_mod.find(programs, progname) orelse
+        fail("unknown program '{s}' (known: {s})", .{ progname, manifest_mod.knownList(manifestContext(), programs) });
 
     var matches: std.ArrayList([]const u8) = .empty;
     var find = RunFind{ .key = key, .key_id = std.fmt.parseInt(u32, key, 10) catch null, .matches = &matches };
-    forEachAccount(programs, prog, &find, collectRun);
+    manifest_mod.forEachAccount(manifestContext(), programs, prog, &find, collectRun);
 
     if (matches.items.len == 0)
         fail("no account '{s}' for program '{s}' (try: ma ls)", .{ key, progname });
@@ -244,20 +168,24 @@ fn cmdRun(programs: []Program, progname: []const u8, key: []const u8, rest: [][]
 
 const NewFind = struct { account: []const u8, max_id: u32 = 0, existing: ?[]const u8 = null };
 
+/// Track the next id and any existing account while creating an account.
+/// Example: seeing "claude-3-work" sets max_id=3 and existing if account is "work".
 fn collectNew(ctx: *NewFind, name: []const u8, p: Parsed) void {
     if (p.id > ctx.max_id) ctx.max_id = p.id;
     if (std.mem.eql(u8, p.account, ctx.account))
         ctx.existing = gpa.dupe(u8, name) catch fail("out of memory", .{});
 }
 
+/// Create or adopt an account folder and its program symlink.
+/// Example: cmdNew("claude", "work") creates "claude-1-work/.claude" and "claude".
 fn cmdNew(programs: []Program, progname: []const u8, account: []const u8) void {
-    const prog = findProgram(programs, progname) orelse
-        fail("unknown program '{s}' (known: {s})", .{ progname, knownList(programs) });
+    const prog = manifest_mod.find(programs, progname) orelse
+        fail("unknown program '{s}' (known: {s})", .{ progname, manifest_mod.knownList(manifestContext(), programs) });
     if (account.len == 0 or std.mem.indexOfScalar(u8, account, '/') != null)
         fail("invalid account name '{s}'", .{account});
 
     var find = NewFind{ .account = account };
-    forEachAccount(programs, prog, &find, collectNew);
+    manifest_mod.forEachAccount(manifestContext(), programs, prog, &find, collectNew);
 
     var folder: []const u8 = undefined;
     if (find.existing) |ex| {
@@ -285,19 +213,13 @@ fn cmdNew(programs: []Program, progname: []const u8, account: []const u8) void {
         else => fail("cannot create symlink '{s}': {s}", .{ link, @errorName(e) }),
     };
 
-    out("\nlog in:   {s} ", .{link});
-    if (std.mem.eql(u8, prog.name, "claude")) {
-        out("/login\n", .{});
-    } else if (std.mem.eql(u8, prog.name, "opencode")) {
-        out("auth login\n", .{});
-    } else {
-        out("    (run the tool's normal login)\n", .{});
-    }
-    out("launch:   ma {s} {s}\n", .{ prog.name, account });
+    out("\nlaunch:   ma {s} {s}\n", .{ prog.name, account });
 }
 
 const LsCtx = struct { prog: *const Program, any: *bool };
 
+/// Print one `ma ls` row for a parsed account folder.
+/// Example: "claude-1-work" prints program=claude, id=1, account=work, and login state.
 fn lsRow(ctx: *LsCtx, name: []const u8, p: Parsed) void {
     ctx.any.* = true;
     const first = join(&.{ root, name, ctx.prog.pairs[0].dir });
@@ -312,15 +234,19 @@ fn lsRow(ctx: *LsCtx, name: []const u8, p: Parsed) void {
     });
 }
 
+/// List every known account folder and whether its first state dir is populated.
+/// Example: with "claude-1-work/.claude" non-empty, output marks it "[logged in]".
 fn cmdLs(programs: []Program) void {
     var any = false;
     for (programs) |*prog| {
         var ctx = LsCtx{ .prog = prog, .any = &any };
-        forEachAccount(programs, prog, &ctx, lsRow);
+        manifest_mod.forEachAccount(manifestContext(), programs, prog, &ctx, lsRow);
     }
     if (!any) out("no accounts yet. create one with:  ./ma new PROGRAM ACCOUNT\n", .{});
 }
 
+/// Print command usage and the manifest's known programs.
+/// Example: usage(programs) prints "ma new PROGRAM ACCOUNT" and "claude, codex, ...".
 fn usage(programs: []Program) void {
     out(
         \\ma — multi-account launcher
@@ -332,9 +258,11 @@ fn usage(programs: []Program) void {
         \\
         \\known programs:
     , .{});
-    out(" {s}\n", .{knownList(programs)});
+    out(" {s}\n", .{manifest_mod.knownList(manifestContext(), programs)});
 }
 
+/// Dispatch the `ma` add-on command line to new, ls, help, or run.
+/// Example: args=["ma","claude","work"] calls cmdRun for claude/work.
 fn dispatch(programs: []Program, args: [][]const u8) void {
     if (args.len < 2) return usage(programs);
     const cmd = args[1];
@@ -349,6 +277,8 @@ fn dispatch(programs: []Program, args: [][]const u8) void {
     cmdRun(programs, args[1], args[2], args[3..]);
 }
 
+/// Program entry point; decide whether this invocation is `ma` or an account symlink.
+/// Example: argv0="ma" dispatches add-ons; argv0="claude-1-work/claude" launches account.
 pub fn main(init: std.process.Init) void {
     io = init.io;
     gpa = init.arena.allocator();
@@ -359,7 +289,8 @@ pub fn main(init: std.process.Init) void {
     while (it.next()) |a| args.append(gpa, a) catch fail("out of memory", .{});
     if (args.items.len == 0) fail("no argv[0]", .{});
 
-    const programs = loadManifest();
+    root = manifest_mod.installRoot(io, gpa, env);
+    const programs = manifest_mod.load(manifestContext());
     // The polyglot wrapper runs the real binary from a cache dir, so args[0] no longer
     // points at the account symlink. The wrapper passes the true invocation path in
     // MA_ARGV0; fall back to args[0] for a directly-run native binary.
