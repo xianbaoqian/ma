@@ -1,20 +1,25 @@
-# Per-account state lives in dotfile dirs that mirror your home (.claude, .codex, .kimi,
-# .config, .local/share). These hold logins / oauth tokens / api keys — never commit them.
-*/.claude/
-*/.codex/
-*/.kimi/
-*/.config/
-*/.local/
+# Whitelist, not blacklist — a deliberate safety choice, not a style one.
+#
+# This tool sits right next to folders full of login tokens and API keys. A blacklist
+# ("ignore the secrets") leaks the day someone adds a tool whose secret file we didn't
+# predict — and people add their own tools here via programs.conf, so that set is unbounded
+# and unknowable. So we flip the default: ignore everything, then allow back only the small,
+# fixed set of files that make up the tool itself.
+#
+# Result: a new secret is ignored automatically. The worst that happens is forgetting to
+# allow a legitimate new tool file — which simply won't show up (loud, harmless), never a
+# leaked credential. Account folders, deploy.conf, the extracted ma-* engines, and zig
+# build leftovers are all ignored for free by rule 1.
 
-# The per-arch engines that `ma` peels off itself on first run. They're regenerated on
-# every machine from the committed `ma`, and they're machine-specific — don't commit them.
-/ma-MACARM
-/ma-LINUXARM
-/ma-LINUXX86
+# 1. ignore everything, at every level
+*
 
-# Your personal list of folders to deploy into (paths are private to your machine).
-deploy.conf
-
-# Zig build leftovers.
-.zig-cache/
-zig-out/
+# 2. allow back exactly the tool's own files (anchored to the repo root with a leading /)
+!/.gitignore
+!/LICENSE
+!/README.md
+!/launcher.zig
+!/build.sh
+!/install.sh
+!/programs.conf
+!/ma
