@@ -1,0 +1,20 @@
+# Per-account state lives in dotfile dirs that mirror your home (.claude, .codex, .kimi,
+# .config, .local/share). These hold logins / oauth tokens / api keys — never commit them.
+*/.claude/
+*/.codex/
+*/.kimi/
+*/.config/
+*/.local/
+
+# The per-arch engines that `ma` peels off itself on first run. They're regenerated on
+# every machine from the committed `ma`, and they're machine-specific — don't commit them.
+/ma-MACARM
+/ma-LINUXARM
+/ma-LINUXX86
+
+# Your personal list of folders to deploy into (paths are private to your machine).
+deploy.conf
+
+# Zig build leftovers.
+.zig-cache/
+zig-out/
