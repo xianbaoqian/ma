@@ -541,20 +541,40 @@ if PATH="$FAKEBIN:$PATH" HOME="$HOME_DIR" MA_TEST_LOG="$LOG" OPENAI_API_KEY=sk-t
   die "expected API-key auth add to be blocked"
 fi
 assert_grep "$CASE/api-block.err" "OPENAI_API_KEY is set"
+
+rm -rf "$ROOT"/codex-*-api
+run_ma new codex api >/dev/null
+CODEX_API_DIR="$(ls -d "$ROOT"/codex-*-api | sed -n '1p')"
+mkdir -p "$CODEX_API_DIR/.codex"
+printf '{"OPENAI_API_KEY":"sk-test"}\n' > "$CODEX_API_DIR/.codex/auth.json"
+run_ma auth ls codex api > "$CASE/codex-api-ls.out"
+assert_grep "$CASE/codex-api-ls.out" "live auth"
+assert_grep "$CASE/codex-api-ls.out" "api-key"
+assert_grep "$CASE/codex-api-ls.out" "API-key auth is not rotatable"
+if run_ma auth check codex api --prune > "$CASE/codex-api-check.out"; then
+  die "expected live API-key auth check to fail"
+fi
+assert_grep "$CASE/codex-api-check.out" "api-key"
+assert_grep "$CASE/codex-api-check.out" "kept"
+if run_ma auth add codex api > "$CASE/codex-api-add.out" 2> "$CASE/codex-api-add.err"; then
+  die "expected live API-key auth add to fail"
+fi
+assert_grep "$CASE/codex-api-add.err" "live api-key auth"
 say "blocks API-key auth for subscription rotation"
 
-rm -rf "$ROOT/codex-1-inferact" "$ROOT/codex-2-cn"
+rm -rf "$ROOT"/codex-*
 run_ma new codex solo >/dev/null
+CODEX_SOLO_DIR="$(ls -d "$ROOT"/codex-*-solo | sed -n '1p')"
 MA_TEST_CODEX_USER=solo@example.test run_ma_logged auth add codex solo >/dev/null
-assert_no_file "$ROOT/codex-1-solo/.codex/ma-auth/.new-token/auth.json"
-assert_file "$ROOT/codex-1-solo/.codex/ma-auth/solo@example.test/auth.json"
-assert_grep "$ROOT/codex-1-solo/.codex/ma-auth/state.tsv" "current	solo@example.test"
+assert_no_file "$CODEX_SOLO_DIR/.codex/ma-auth/.new-token/auth.json"
+assert_file "$CODEX_SOLO_DIR/.codex/ma-auth/solo@example.test/auth.json"
+assert_grep "$CODEX_SOLO_DIR/.codex/ma-auth/state.tsv" "current	solo@example.test"
 MA_TEST_CODEX_USER=solo@example.test run_ma_logged auth add codex solo >/dev/null
-assert_file "$ROOT/codex-1-solo/.codex/ma-auth/solo@example.test-2/auth.json"
+assert_file "$CODEX_SOLO_DIR/.codex/ma-auth/solo@example.test-2/auth.json"
 run_ma_logged auth add codex named >/dev/null
-assert_file "$ROOT/codex-1-solo/.codex/ma-auth/named/auth.json"
-assert_file "$ROOT/codex-1-solo/.codex/ma-auth/solo@example.test/auth.json"
-assert_file "$ROOT/codex-1-solo/.codex/ma-auth/solo@example.test-2/auth.json"
+assert_file "$CODEX_SOLO_DIR/.codex/ma-auth/named/auth.json"
+assert_file "$CODEX_SOLO_DIR/.codex/ma-auth/solo@example.test/auth.json"
+assert_file "$CODEX_SOLO_DIR/.codex/ma-auth/solo@example.test-2/auth.json"
 say "auto-names auth tokens from inferred user identity"
 
 echo "all tests passed"

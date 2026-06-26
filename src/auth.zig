@@ -855,6 +855,45 @@ fn hasApiKeyAuth(ctx: Context, root: []const u8) bool {
     return false;
 }
 
+/// Return why the live account auth is not a rotatable login token.
+/// Example: a live Codex auth.json with OPENAI_API_KEY returns an API-key reason.
+fn liveAuthProblem(ctx: Context, program: []const u8, root: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, program, "codex")) {
+        if (exists(ctx, join(ctx, &.{ root, "auth.json" })))
+            return codexAuthProblem(ctx, root);
+        if (hasApiKeyAuth(ctx, root)) return "API-key auth is not rotatable";
+        return null;
+    }
+    if (hasApiKeyAuth(ctx, root)) return "API-key auth is not rotatable";
+    if (hasAuth(ctx, program, root) and !variantUsableLocal(ctx, program, root))
+        return "live auth is not a refresh-capable subscription login";
+    return null;
+}
+
+/// Return a compact public label for live auth that cannot be rotated.
+/// Example: API-key auth is reported as "api-key" without printing the key.
+fn liveAuthKind(ctx: Context, program: []const u8, root: []const u8) []const u8 {
+    if (hasApiKeyAuth(ctx, root)) return "api-key";
+    if (std.mem.eql(u8, program, "codex")) {
+        const problem = codexAuthProblem(ctx, root) orelse return "subscription";
+        if (asciiIndexOfIgnoreCase(problem, "personal access token") != null) return "personal-token";
+        if (asciiIndexOfIgnoreCase(problem, "agent identity") != null) return "agent-identity";
+        if (asciiIndexOfIgnoreCase(problem, "Bedrock") != null) return "bedrock-api";
+    }
+    return "non-rotatable";
+}
+
+/// Fail because live auth exists but cannot participate in token rotation.
+/// Example: API-key auth blocks `ma auth add codex work`.
+fn dieLiveAuthProblem(ctx: Context, program: []const u8, account: []const u8, root: []const u8, problem: []const u8) noreturn {
+    die(ctx, "{s} account '{s}' has live {s} auth ({s}); ma auth only rotates subscription/device logins", .{
+        program,
+        account,
+        liveAuthKind(ctx, program, root),
+        problem,
+    });
+}
+
 /// Fail if a credential environment variable would bypass file-backed auth.
 /// Example: OPENAI_API_KEY blocks Codex auth add/rotate.
 fn blockCredentialEnv(ctx: Context, program: []const u8) void {
@@ -1690,8 +1729,8 @@ pub fn cmdAdd(ctx: Context, programs: []Program, progname: []const u8, account_k
     blockCredentialEnv(ctx, resolved.program.name);
     const root = stateRoot(ctx, resolved.program, resolved.account.path);
     Dir.cwd().createDirPath(ctx.io, root) catch |e| die(ctx, "cannot create '{s}': {s}", .{ root, @errorName(e) });
-    if (hasApiKeyAuth(ctx, root))
-        die(ctx, "{s} account '{s}' has API-key auth; ma auth only rotates subscription/device logins", .{ resolved.program.name, resolved.account.account });
+    if (liveAuthProblem(ctx, resolved.program.name, root)) |problem|
+        dieLiveAuthProblem(ctx, resolved.program.name, resolved.account.account, root, problem);
 
     var state_buf: [max_auth_tokens]Variant = undefined;
     var st = loadState(ctx, root, &state_buf);
@@ -1802,8 +1841,8 @@ pub fn cmdRotate(ctx: Context, programs: []Program, progname: []const u8, accoun
     const resolved = resolveAccount(ctx, programs, progname, account_key);
     blockCredentialEnv(ctx, resolved.program.name);
     const root = stateRoot(ctx, resolved.program, resolved.account.path);
-    if (hasApiKeyAuth(ctx, root))
-        die(ctx, "{s} account '{s}' has API-key auth; ma auth only rotates subscription/device logins", .{ resolved.program.name, resolved.account.account });
+    if (liveAuthProblem(ctx, resolved.program.name, root)) |problem|
+        dieLiveAuthProblem(ctx, resolved.program.name, resolved.account.account, root, problem);
 
     var state_buf: [max_auth_tokens]Variant = undefined;
     var st = loadState(ctx, root, &state_buf);
@@ -1888,10 +1927,22 @@ pub fn cmdCheck(ctx: Context, programs: []Program, progname: []const u8, account
     const root = stateRoot(ctx, resolved.program, resolved.account.path);
     var state_buf: [max_auth_tokens]Variant = undefined;
     var st = loadState(ctx, root, &state_buf);
+    if (st.len == 0) {
+        if (liveAuthProblem(ctx, resolved.program.name, root)) |problem| {
+            out(ctx, "{s:<5} {s:<16} {s}  {s}  kept\n", .{
+                "bad",
+                liveAuthKind(ctx, resolved.program.name, root),
+                "unknown",
+                problem,
+            });
+            std.process.exit(1);
+        }
+    }
     captureLiveDefault(ctx, resolved.program.name, root, &st);
     syncLiveCodexCurrent(ctx, resolved.program.name, root, st);
-    if (st.len == 0)
+    if (st.len == 0) {
         die(ctx, "{s} account '{s}' has no auth tokens to check", .{ resolved.program.name, resolved.account.account });
+    }
 
     var i: usize = 0;
     var failed: usize = 0;
@@ -1954,8 +2005,20 @@ pub fn cmdList(ctx: Context, programs: []Program, progname: []const u8, account_
     var state_buf: [max_auth_tokens]Variant = undefined;
     const st = loadState(ctx, root, &state_buf);
     syncLiveCodexCurrent(ctx, resolved.program.name, root, st);
-    if (st.len == 0)
+    if (st.len == 0) {
+        if (liveAuthProblem(ctx, resolved.program.name, root)) |problem| {
+            out(ctx, "{s} account '{s}' live auth\n", .{ resolved.program.name, resolved.account.account });
+            out(ctx, "{s:<16} {s:<18} {s:<24} {s}\n", .{ "KIND", "FINGERPRINT", "IDENTITY", "STATUS" });
+            out(ctx, "{s:<16} {s:<18} {s:<24} {s}\n", .{
+                liveAuthKind(ctx, resolved.program.name, root),
+                fileDigest(ctx, join(ctx, &.{ root, if (std.mem.eql(u8, resolved.program.name, "codex")) "auth.json" else ".credentials.json" })),
+                if (std.mem.eql(u8, resolved.program.name, "codex")) inferCodexIdentity(ctx, root) else inferClaudeIdentity(ctx, root),
+                problem,
+            });
+            return;
+        }
         die(ctx, "{s} account '{s}' has no auth tokens", .{ resolved.program.name, resolved.account.account });
+    }
 
     out(ctx, "{s} account '{s}' auth tokens\n", .{ resolved.program.name, resolved.account.account });
     out(ctx, "{s:<3} {s:<16} {s:<18} {s:<24} {s:<17} {s:<17} {s}\n", .{
