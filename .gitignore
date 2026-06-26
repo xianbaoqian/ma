@@ -23,6 +23,7 @@
 !/src/launcher.zig
 !/src/manifest.zig
 !/src/resume.zig
+!/src/auth.zig
 !/build.sh
 !/install.sh
 !/test.sh

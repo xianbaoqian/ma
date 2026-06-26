@@ -18,6 +18,7 @@
 const std = @import("std");
 const manifest_mod = @import("manifest.zig");
 const resume_mod = @import("resume.zig");
+const auth_mod = @import("auth.zig");
 const Io = std.Io;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
@@ -25,11 +26,27 @@ const path = std.fs.path;
 
 const Program = manifest_mod.Program;
 const Parsed = manifest_mod.Parsed;
+const max_exec_args = 4096;
+const workspace_bytes = 256 << 20;
+const max_account_folder_len = 1024;
+
+comptime {
+    if (max_exec_args < 4096) @compileError("ma argv capacity must stay at least 4096");
+    if (workspace_bytes < manifest_mod.manifest_read_limit + auth_mod.auth_file_read_limit + resume_mod.history_read_limit + resume_mod.session_read_limit)
+        @compileError("ma workspace must cover the largest bounded file reads");
+    if (workspace_bytes < (@as(usize, manifest_mod.max_accounts_per_program) * 4096))
+        @compileError("ma workspace must cover account scan metadata");
+    if (workspace_bytes < (@as(usize, auth_mod.max_auth_tokens) * 4096))
+        @compileError("ma workspace must cover auth token metadata");
+    if (workspace_bytes < (@as(usize, resume_mod.max_session_rows) * 4096))
+        @compileError("ma workspace must cover session list metadata");
+}
 
 // Globals set once in main, so helpers stay K&R-short instead of threading them everywhere.
 var io: Io = undefined;
 var gpa: Allocator = undefined;
 var env: *std.process.Environ.Map = undefined;
+var workspace: [workspace_bytes]u8 = undefined;
 // Install dir: where `ma` and programs.conf live. Account folders live here too, so the
 // add-ons work from any cwd (e.g. when `ma` is aliased). Set once in main.
 var root: []const u8 = undefined;
@@ -56,7 +73,7 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 /// Join path fragments with the platform separator.
 /// Example: join(&.{ "/tmp/accts", "claude-1-work", ".claude" }) returns that path joined.
 fn join(parts: []const []const u8) []const u8 {
-    return path.join(gpa, parts) catch fail("out of memory", .{});
+    return path.join(gpa, parts) catch fail("static workspace exhausted", .{});
 }
 
 /// Resolve a possibly relative path into a canonical absolute path.
@@ -64,7 +81,7 @@ fn join(parts: []const []const u8) []const u8 {
 fn absolutize(p: []const u8) []const u8 {
     const cwd = std.process.currentPathAlloc(io, gpa) catch |e|
         fail("cannot read current directory: {s}", .{@errorName(e)});
-    return path.resolve(gpa, &.{ cwd, p }) catch fail("out of memory", .{});
+    return path.resolve(gpa, &.{ cwd, p }) catch fail("static workspace exhausted", .{});
 }
 
 /// Build the manifest module context from launcher globals.
@@ -113,27 +130,46 @@ fn launch(programs: []Program, args: [][]const u8, argv0: []const u8, arg0base: 
         resume_mod.maybeAdopt(.{ .io = io, .gpa = gpa, .env = env, .install_root = root }, p.program, p.account, folder, args);
 
     for (p.program.pairs) |pair|
-        env.put(pair.name, join(&.{ folder, pair.dir })) catch fail("out of memory", .{});
+        env.put(pair.name, join(&.{ folder, pair.dir })) catch fail("static workspace exhausted", .{});
+    auth_mod.applyLaunchEnv(.{ .io = io, .gpa = gpa, .env = env, .install_root = root }, p.program, folder);
 
     const real = which(p.program.binary, folder) orelse
         fail("binary '{s}' not found in PATH", .{p.program.binary});
 
-    const argv = gpa.alloc([]const u8, args.len) catch fail("out of memory", .{});
-    argv[0] = real;
-    for (args[1..], 1..) |a, i| argv[i] = a;
-    exec(argv);
+    if (args.len > max_exec_args) fail("too many command arguments for one request (max {d})", .{max_exec_args});
+    var argv_buf: [max_exec_args][]const u8 = undefined;
+    argv_buf[0] = real;
+    for (args[1..], 1..) |a, i| argv_buf[i] = a;
+    exec(argv_buf[0..args.len]);
 }
 
 // ---- ADD-ONS ----
 
-const RunFind = struct { key: []const u8, key_id: ?u32, matches: *std.ArrayList([]const u8) };
+const RunFind = struct {
+    key: []const u8,
+    key_id: ?u32,
+    count: usize = 0,
+    first: ?[]const u8 = null,
+    second: ?[]const u8 = null,
+    first_buf: [max_account_folder_len]u8 = undefined,
+    second_buf: [max_account_folder_len]u8 = undefined,
+};
 
 /// Record account folders that match a requested account name or numeric id.
 /// Example: key="work" records "claude-1-work"; key_id=1 records account id 1.
 fn collectRun(ctx: *RunFind, name: []const u8, p: Parsed) void {
     const hit = if (ctx.key_id) |k| p.id == k else std.mem.eql(u8, p.account, ctx.key);
-    if (hit) ctx.matches.append(gpa, gpa.dupe(u8, name) catch fail("out of memory", .{})) catch
-        fail("out of memory", .{});
+    if (!hit) return;
+    ctx.count += 1;
+    if (ctx.count == 1) {
+        if (name.len > ctx.first_buf.len) fail("account folder name is too long for one command to load (max {d} bytes)", .{max_account_folder_len});
+        @memcpy(ctx.first_buf[0..name.len], name);
+        ctx.first = ctx.first_buf[0..name.len];
+    } else if (ctx.count == 2) {
+        if (name.len > ctx.second_buf.len) fail("account folder name is too long for one command to load (max {d} bytes)", .{max_account_folder_len});
+        @memcpy(ctx.second_buf[0..name.len], name);
+        ctx.second = ctx.second_buf[0..name.len];
+    }
 }
 
 /// Resolve `ma PROGRAM NAME|ID [args...]` into an account launcher and exec it.
@@ -142,28 +178,25 @@ fn cmdRun(programs: []Program, progname: []const u8, key: []const u8, rest: [][]
     const prog = manifest_mod.find(programs, progname) orelse
         fail("unknown program '{s}' (known: {s})", .{ progname, manifest_mod.knownList(manifestContext(), programs) });
 
-    var matches: std.ArrayList([]const u8) = .empty;
-    var find = RunFind{ .key = key, .key_id = std.fmt.parseInt(u32, key, 10) catch null, .matches = &matches };
+    var find = RunFind{ .key = key, .key_id = std.fmt.parseInt(u32, key, 10) catch null };
     manifest_mod.forEachAccount(manifestContext(), programs, prog, &find, collectRun);
 
-    if (matches.items.len == 0)
+    if (find.count == 0)
         fail("no account '{s}' for program '{s}' (try: ma ls)", .{ key, progname });
-    if (matches.items.len > 1) {
-        var b: std.ArrayList(u8) = .empty;
-        for (matches.items) |m| {
-            b.appendSlice(gpa, "\n  ") catch {};
-            b.appendSlice(gpa, m) catch {};
-        }
-        fail("'{s} {s}' is ambiguous, matches:{s}", .{ progname, key, b.items });
+    if (find.count > 1) {
+        if (find.second) |second|
+            fail("'{s} {s}' is ambiguous, matches:\n  {s}\n  {s}", .{ progname, key, find.first.?, second });
+        fail("'{s} {s}' is ambiguous", .{ progname, key });
     }
 
     // Hand off to the kernel via the per-account symlink; its (absolute) path tells the
     // kernel the folder, so this works regardless of the caller's cwd.
-    const launcher = join(&.{ root, matches.items[0], prog.name });
-    const argv = gpa.alloc([]const u8, 1 + rest.len) catch fail("out of memory", .{});
-    argv[0] = launcher;
-    for (rest, 1..) |a, i| argv[i] = a;
-    exec(argv);
+    const launcher = join(&.{ root, find.first.?, prog.name });
+    if (1 + rest.len > max_exec_args) fail("too many command arguments for one request (max {d})", .{max_exec_args});
+    var argv_buf: [max_exec_args][]const u8 = undefined;
+    argv_buf[0] = launcher;
+    for (rest, 1..) |a, i| argv_buf[i] = a;
+    exec(argv_buf[0 .. 1 + rest.len]);
 }
 
 const NewFind = struct { account: []const u8, max_id: u32 = 0, existing: ?[]const u8 = null };
@@ -173,7 +206,7 @@ const NewFind = struct { account: []const u8, max_id: u32 = 0, existing: ?[]cons
 fn collectNew(ctx: *NewFind, name: []const u8, p: Parsed) void {
     if (p.id > ctx.max_id) ctx.max_id = p.id;
     if (std.mem.eql(u8, p.account, ctx.account))
-        ctx.existing = gpa.dupe(u8, name) catch fail("out of memory", .{});
+        ctx.existing = gpa.dupe(u8, name) catch fail("static workspace exhausted", .{});
 }
 
 /// Create or adopt an account folder and its program symlink.
@@ -193,7 +226,7 @@ fn cmdNew(programs: []Program, progname: []const u8, account: []const u8) void {
         out("adopting existing {s}\n", .{ex});
     } else {
         folder = std.fmt.allocPrint(gpa, "{s}-{d}-{s}", .{ prog.name, find.max_id + 1, account }) catch
-            fail("out of memory", .{});
+            fail("static workspace exhausted", .{});
         Dir.cwd().createDirPath(io, join(&.{ root, folder })) catch |e|
             fail("cannot create '{s}': {s}", .{ folder, @errorName(e) });
         out("created {s}\n", .{folder});
@@ -274,6 +307,12 @@ fn usage(programs: []Program) void {
         \\ma — multi-account launcher
         \\
         \\  ./ma new PROGRAM ACCOUNT      create an isolated account folder
+        \\  ./ma auth add PROGRAM [ACCOUNT] [TOKEN]
+        \\  ./ma auth ls PROGRAM [ACCOUNT]
+        \\  ./ma auth rotate PROGRAM [ACCOUNT]
+        \\  ./ma auth check PROGRAM [ACCOUNT] [--prune]
+        \\  ./ma auth remove PROGRAM [ACCOUNT] TOKEN
+        \\  ./ma auth clear PROGRAM [ACCOUNT]
         \\  ./ma PROGRAM NAME|ID [args]   launch an account (args pass through)
         \\  ./ma PROGRAM ps               list sessions for the current folder
         \\  ./ma ls                       list accounts and login state
@@ -284,6 +323,42 @@ fn usage(programs: []Program) void {
     out(" {s}\n", .{manifest_mod.knownList(manifestContext(), programs)});
 }
 
+/// Dispatch `ma auth ...` for file-backed subscription login tokens.
+/// Example: `ma auth add codex work sub1` runs Codex device auth into ma-auth/sub1.
+fn cmdAuth(programs: []Program, args: [][]const u8) void {
+    if (args.len < 4) fail("usage: ma auth add PROGRAM [ACCOUNT] [TOKEN] | ma auth ls PROGRAM [ACCOUNT] | ma auth rotate PROGRAM [ACCOUNT] | ma auth check PROGRAM [ACCOUNT] [--prune] | ma auth remove PROGRAM [ACCOUNT] TOKEN | ma auth clear PROGRAM [ACCOUNT]", .{});
+    const sub = args[2];
+    const ctx = auth_mod.Context{ .io = io, .gpa = gpa, .env = env, .install_root = root };
+    if (std.mem.eql(u8, sub, "add")) {
+        if (args.len < 4 or args.len > 6) fail("usage: ma auth add PROGRAM [ACCOUNT] [TOKEN]", .{});
+        return auth_mod.cmdAddArgs(ctx, programs, args[3], args[4..]);
+    }
+    if (std.mem.eql(u8, sub, "ls")) {
+        if (args.len == 4) return auth_mod.cmdList(ctx, programs, args[3], null);
+        if (args.len == 5) return auth_mod.cmdList(ctx, programs, args[3], args[4]);
+        fail("usage: ma auth ls PROGRAM [ACCOUNT]", .{});
+    }
+    if (std.mem.eql(u8, sub, "rotate")) {
+        if (args.len == 4) return auth_mod.cmdRotate(ctx, programs, args[3], null);
+        if (args.len == 5) return auth_mod.cmdRotate(ctx, programs, args[3], args[4]);
+        fail("usage: ma auth rotate PROGRAM [ACCOUNT]", .{});
+    }
+    if (std.mem.eql(u8, sub, "check")) {
+        if (args.len < 4 or args.len > 6) fail("usage: ma auth check PROGRAM [ACCOUNT] [--prune]", .{});
+        return auth_mod.cmdCheckArgs(ctx, programs, args[3], args[4..]);
+    }
+    if (std.mem.eql(u8, sub, "remove")) {
+        if (args.len < 5 or args.len > 6) fail("usage: ma auth remove PROGRAM [ACCOUNT] TOKEN", .{});
+        return auth_mod.cmdRemoveArgs(ctx, programs, args[3], args[4..]);
+    }
+    if (std.mem.eql(u8, sub, "clear")) {
+        if (args.len == 4) return auth_mod.cmdClear(ctx, programs, args[3], null);
+        if (args.len == 5) return auth_mod.cmdClear(ctx, programs, args[3], args[4]);
+        fail("usage: ma auth clear PROGRAM [ACCOUNT]", .{});
+    }
+    fail("unknown auth command '{s}' (try: ma help)", .{sub});
+}
+
 /// Dispatch the `ma` add-on command line to new, ls, help, or run.
 /// Example: args=["ma","claude","work"] calls cmdRun for claude/work.
 fn dispatch(programs: []Program, args: [][]const u8) void {
@@ -292,6 +367,7 @@ fn dispatch(programs: []Program, args: [][]const u8) void {
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help"))
         return usage(programs);
     if (std.mem.eql(u8, cmd, "ls")) return cmdLs(programs);
+    if (std.mem.eql(u8, cmd, "auth")) return cmdAuth(programs, args);
     if (std.mem.eql(u8, cmd, "new")) {
         if (args.len != 4) fail("usage: ma new PROGRAM ACCOUNT", .{});
         return cmdNew(programs, args[2], args[3]);
@@ -308,24 +384,31 @@ fn dispatch(programs: []Program, args: [][]const u8) void {
 /// Example: argv0="ma" dispatches add-ons; argv0="claude-1-work/claude" launches account.
 pub fn main(init: std.process.Init) void {
     io = init.io;
-    gpa = init.arena.allocator();
+    var fixed = std.heap.FixedBufferAllocator.init(&workspace);
+    gpa = fixed.allocator();
     env = init.environ_map;
 
-    var args: std.ArrayList([]const u8) = .empty;
+    var args_buf: [max_exec_args][]const u8 = undefined;
+    var args_len: usize = 0;
     var it = std.process.Args.Iterator.init(init.minimal.args);
-    while (it.next()) |a| args.append(gpa, a) catch fail("out of memory", .{});
-    if (args.items.len == 0) fail("no argv[0]", .{});
+    while (it.next()) |a| {
+        if (args_len == args_buf.len) fail("too many command arguments for one request (max {d})", .{max_exec_args});
+        args_buf[args_len] = a;
+        args_len += 1;
+    }
+    const args = args_buf[0..args_len];
+    if (args.len == 0) fail("no argv[0]", .{});
 
     root = manifest_mod.installRoot(io, gpa, env);
     const programs = manifest_mod.load(manifestContext());
     // The polyglot wrapper runs the real binary from a cache dir, so args[0] no longer
     // points at the account symlink. The wrapper passes the true invocation path in
     // MA_ARGV0; fall back to args[0] for a directly-run native binary.
-    const argv0 = env.get("MA_ARGV0") orelse args.items[0];
+    const argv0 = env.get("MA_ARGV0") orelse args[0];
     const arg0base = path.basename(argv0);
     if (std.mem.eql(u8, arg0base, "ma")) {
-        dispatch(programs, args.items);
+        dispatch(programs, args);
     } else {
-        launch(programs, args.items, argv0, arg0base);
+        launch(programs, args, argv0, arg0base);
     }
 }

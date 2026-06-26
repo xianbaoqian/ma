@@ -7,6 +7,11 @@ const path = std.fs.path;
 
 const Program = manifest.Program;
 
+pub const history_read_limit = 64 << 20;
+pub const session_read_limit = 8 << 20;
+pub const max_session_rows = 4096;
+pub const max_walk_entries = 65536;
+
 pub const Context = struct {
     io: Io,
     gpa: Allocator,
@@ -44,7 +49,7 @@ fn warn(ctx: Context, comptime fmt: []const u8, args: anytype) void {
 /// Join path fragments with the allocator in the resume context.
 /// Example: join(ctx, &.{"/accounts/claude-1-work", ".claude"}) returns the state root.
 fn join(ctx: Context, parts: []const []const u8) []const u8 {
-    return path.join(ctx.gpa, parts) catch die(ctx, "out of memory", .{});
+    return path.join(ctx.gpa, parts) catch die(ctx, "static workspace exhausted", .{});
 }
 
 /// Map a supported program to how its session file is named.
@@ -126,16 +131,20 @@ fn find(ctx: Context, root: []const u8, m: Mode, id: []const u8) ?Hit {
     defer dir.close(ctx.io);
     var w = dir.walk(ctx.gpa) catch return null;
     defer w.deinit();
+    var seen: usize = 0;
     while (w.next(ctx.io) catch null) |e| {
+        if (seen == max_walk_entries)
+            die(ctx, "too many files under '{s}' for one command to scan while looking for session {s} (max {d}; disk storage is not limited)", .{ root, id, max_walk_entries });
+        seen += 1;
         if (e.kind != .file or !wanted(m, e.basename, id)) continue;
         const sidecar = if (m == .exact_jsonl) blk: {
-            const d = path.dirname(e.path) orelse break :blk ctx.gpa.dupe(u8, id) catch die(ctx, "out of memory", .{});
+            const d = path.dirname(e.path) orelse break :blk ctx.gpa.dupe(u8, id) catch die(ctx, "static workspace exhausted", .{});
             break :blk join(ctx, &.{ d, id });
         } else null;
         return .{
             .label = "",
             .root = root,
-            .rel = ctx.gpa.dupe(u8, e.path) catch die(ctx, "out of memory", .{}),
+            .rel = ctx.gpa.dupe(u8, e.path) catch die(ctx, "static workspace exhausted", .{}),
             .sidecar = sidecar,
         };
     }
@@ -150,17 +159,17 @@ fn remember(ctx: Context, found: *?Hit, label: []const u8, root: []const u8, tar
     const h = find(ctx, root, m, id) orelse return;
     if (found.* != null) die(ctx, "session {s} exists in more than one profile", .{id});
     found.* = .{
-        .label = ctx.gpa.dupe(u8, label) catch die(ctx, "out of memory", .{}),
-        .root = ctx.gpa.dupe(u8, root) catch die(ctx, "out of memory", .{}),
-        .rel = ctx.gpa.dupe(u8, h.rel) catch die(ctx, "out of memory", .{}),
-        .sidecar = if (h.sidecar) |s| (ctx.gpa.dupe(u8, s) catch die(ctx, "out of memory", .{})) else null,
+        .label = ctx.gpa.dupe(u8, label) catch die(ctx, "static workspace exhausted", .{}),
+        .root = ctx.gpa.dupe(u8, root) catch die(ctx, "static workspace exhausted", .{}),
+        .rel = ctx.gpa.dupe(u8, h.rel) catch die(ctx, "static workspace exhausted", .{}),
+        .sidecar = if (h.sidecar) |s| (ctx.gpa.dupe(u8, s) catch die(ctx, "static workspace exhausted", .{})) else null,
     };
 }
 
 /// Read a file if it exists; missing files are treated as null.
 /// Example: readOpt(ctx, "missing/history.jsonl") returns null.
 fn readOpt(ctx: Context, p: []const u8) ?[]const u8 {
-    return Dir.cwd().readFileAlloc(ctx.io, p, ctx.gpa, .limited(64 << 20)) catch |e| switch (e) {
+    return Dir.cwd().readFileAlloc(ctx.io, p, ctx.gpa, .limited(history_read_limit)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => die(ctx, "cannot read '{s}': {s}", .{ p, @errorName(e) }),
     };
@@ -169,7 +178,7 @@ fn readOpt(ctx: Context, p: []const u8) ?[]const u8 {
 /// Read a session-sized file; missing files are ignored because sessions can move.
 /// Example: readSession(ctx, "uuid.jsonl") returns its bytes or null.
 fn readSession(ctx: Context, p: []const u8) ?[]const u8 {
-    return Dir.cwd().readFileAlloc(ctx.io, p, ctx.gpa, .limited(8 << 20)) catch |e| switch (e) {
+    return Dir.cwd().readFileAlloc(ctx.io, p, ctx.gpa, .limited(session_read_limit)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => die(ctx, "cannot read '{s}': {s}", .{ p, @errorName(e) }),
     };
@@ -184,18 +193,18 @@ fn topic(ctx: Context, raw: []const u8) []const u8 {
     while (it.nextCodepointSlice()) |cp| {
         const is_space = cp.len == 1 and (cp[0] == ' ' or cp[0] == '\t' or cp[0] == '\r' or cp[0] == '\n');
         if (is_space) {
-            if (b.items.len != 0 and !prev_space) b.append(ctx.gpa, ' ') catch die(ctx, "out of memory", .{});
+            if (b.items.len != 0 and !prev_space) b.append(ctx.gpa, ' ') catch die(ctx, "static workspace exhausted", .{});
             prev_space = true;
             continue;
         }
         if (b.items.len + cp.len > 52) {
-            b.appendSlice(ctx.gpa, "...") catch die(ctx, "out of memory", .{});
+            b.appendSlice(ctx.gpa, "...") catch die(ctx, "static workspace exhausted", .{});
             break;
         }
-        b.appendSlice(ctx.gpa, cp) catch die(ctx, "out of memory", .{});
+        b.appendSlice(ctx.gpa, cp) catch die(ctx, "static workspace exhausted", .{});
         prev_space = false;
     }
-    return b.toOwnedSlice(ctx.gpa) catch die(ctx, "out of memory", .{});
+    return b.toOwnedSlice(ctx.gpa) catch die(ctx, "static workspace exhausted", .{});
 }
 
 /// Return a string field from a parsed JSON object.
@@ -257,7 +266,7 @@ fn jsonlSession(ctx: Context, account: []const u8, id: []const u8, file_path: []
     var match_cwd = cwd == null;
     var session_id = id;
     var row = PsRow{
-        .account = ctx.gpa.dupe(u8, account) catch die(ctx, "out of memory", .{}),
+        .account = ctx.gpa.dupe(u8, account) catch die(ctx, "static workspace exhausted", .{}),
         .id = "",
         .topic = "",
         .modified = modified,
@@ -294,7 +303,7 @@ fn jsonlSession(ctx: Context, account: []const u8, id: []const u8, file_path: []
             if (userText(v)) |s| row.topic = topic(ctx, s);
         }
     }
-    row.id = ctx.gpa.dupe(u8, session_id) catch die(ctx, "out of memory", .{});
+    row.id = ctx.gpa.dupe(u8, session_id) catch die(ctx, "static workspace exhausted", .{});
     return if (match_cwd) row else null;
 }
 
@@ -302,8 +311,8 @@ fn jsonlSession(ctx: Context, account: []const u8, id: []const u8, file_path: []
 /// Example: projectName(ctx, "/tmp/work") returns "-tmp-work".
 fn projectName(ctx: Context, cwd: []const u8) []const u8 {
     var b: std.ArrayList(u8) = .empty;
-    for (cwd) |c| b.append(ctx.gpa, if (c == '/' or c == '\\') '-' else c) catch die(ctx, "out of memory", .{});
-    return b.toOwnedSlice(ctx.gpa) catch die(ctx, "out of memory", .{});
+    for (cwd) |c| b.append(ctx.gpa, if (c == '/' or c == '\\') '-' else c) catch die(ctx, "static workspace exhausted", .{});
+    return b.toOwnedSlice(ctx.gpa) catch die(ctx, "static workspace exhausted", .{});
 }
 
 /// Extract the session id from a Claude session basename.
@@ -340,7 +349,7 @@ fn fmtTime(ctx: Context, secs: i64) []const u8 {
         md.day_index + 1,
         ds.getHoursIntoDay(),
         ds.getMinutesIntoHour(),
-    }) catch die(ctx, "out of memory", .{});
+    }) catch die(ctx, "static workspace exhausted", .{});
 }
 
 /// Format a duration as h/m/s.
@@ -354,10 +363,10 @@ fn fmtDuration(ctx: Context, start: i64, seen: i64) []const u8 {
     delta %= 3600;
     const minutes = delta / 60;
     const seconds = delta % 60;
-    if (days != 0) return std.fmt.allocPrint(ctx.gpa, "{d}d{d:0>2}h", .{ days, hours }) catch die(ctx, "out of memory", .{});
-    if (hours != 0) return std.fmt.allocPrint(ctx.gpa, "{d}h{d:0>2}m", .{ hours, minutes }) catch die(ctx, "out of memory", .{});
-    if (minutes != 0) return std.fmt.allocPrint(ctx.gpa, "{d}m{d:0>2}s", .{ minutes, seconds }) catch die(ctx, "out of memory", .{});
-    return std.fmt.allocPrint(ctx.gpa, "{d}s", .{seconds}) catch die(ctx, "out of memory", .{});
+    if (days != 0) return std.fmt.allocPrint(ctx.gpa, "{d}d{d:0>2}h", .{ days, hours }) catch die(ctx, "static workspace exhausted", .{});
+    if (hours != 0) return std.fmt.allocPrint(ctx.gpa, "{d}h{d:0>2}m", .{ hours, minutes }) catch die(ctx, "static workspace exhausted", .{});
+    if (minutes != 0) return std.fmt.allocPrint(ctx.gpa, "{d}m{d:0>2}s", .{ minutes, seconds }) catch die(ctx, "static workspace exhausted", .{});
+    return std.fmt.allocPrint(ctx.gpa, "{d}s", .{seconds}) catch die(ctx, "static workspace exhausted", .{});
 }
 
 /// Append rows from a recursive JSONL session tree.
@@ -367,14 +376,21 @@ fn jsonlPs(ctx: Context, account: []const u8, root: []const u8, cwd: ?[]const u8
     defer dir.close(ctx.io);
     var w = dir.walk(ctx.gpa) catch return;
     defer w.deinit();
+    var seen: usize = 0;
     while (w.next(ctx.io) catch |e| die(ctx, "cannot scan '{s}': {s}", .{ root, @errorName(e) })) |e| {
+        if (seen == max_walk_entries)
+            die(ctx, "too many files under '{s}' for one command to scan while listing sessions (max {d}; disk storage is not limited)", .{ root, max_walk_entries });
+        seen += 1;
         if (e.kind != .file) continue;
         const id = idFn(e.basename) orelse continue;
         const file_path = join(ctx, &.{ root, e.path });
         const st = Dir.cwd().statFile(ctx.io, file_path, .{}) catch continue;
         const modified: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
-        if (jsonlSession(ctx, account, id, file_path, modified, cwd)) |row|
-            rows.append(ctx.gpa, row) catch die(ctx, "out of memory", .{});
+        if (jsonlSession(ctx, account, id, file_path, modified, cwd)) |row| {
+            if (rows.items.len == max_session_rows)
+                die(ctx, "too many sessions for one command to keep in RAM (max {d}; disk storage is not limited)", .{max_session_rows});
+            rows.append(ctx.gpa, row) catch die(ctx, "static workspace exhausted", .{});
+        }
     }
 }
 
@@ -437,10 +453,10 @@ fn historyPart(ctx: Context, data: []const u8, id: []const u8, want: bool) []con
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         if ((std.mem.indexOf(u8, line, id) != null) != want) continue;
-        b.appendSlice(ctx.gpa, line) catch die(ctx, "out of memory", .{});
-        b.append(ctx.gpa, '\n') catch die(ctx, "out of memory", .{});
+        b.appendSlice(ctx.gpa, line) catch die(ctx, "static workspace exhausted", .{});
+        b.append(ctx.gpa, '\n') catch die(ctx, "static workspace exhausted", .{});
     }
-    return b.toOwnedSlice(ctx.gpa) catch die(ctx, "out of memory", .{});
+    return b.toOwnedSlice(ctx.gpa) catch die(ctx, "static workspace exhausted", .{});
 }
 
 /// Create the parent directory for a path, if the path has one.
@@ -479,9 +495,9 @@ fn moveHistory(ctx: Context, src_root: []const u8, dst_root: []const u8, id: []c
     const old = readOpt(ctx, dst) orelse "";
     if (std.mem.indexOf(u8, old, id) != null) return;
     var b: std.ArrayList(u8) = .empty;
-    b.appendSlice(ctx.gpa, old) catch die(ctx, "out of memory", .{});
-    if (old.len != 0 and old[old.len - 1] != '\n') b.append(ctx.gpa, '\n') catch die(ctx, "out of memory", .{});
-    b.appendSlice(ctx.gpa, moved) catch die(ctx, "out of memory", .{});
+    b.appendSlice(ctx.gpa, old) catch die(ctx, "static workspace exhausted", .{});
+    if (old.len != 0 and old[old.len - 1] != '\n') b.append(ctx.gpa, '\n') catch die(ctx, "static workspace exhausted", .{});
+    b.appendSlice(ctx.gpa, moved) catch die(ctx, "static workspace exhausted", .{});
     ensureParent(ctx, dst);
     Dir.cwd().writeFile(ctx.io, .{ .sub_path = dst, .data = b.items }) catch |e|
         die(ctx, "cannot update '{s}': {s}", .{ dst, @errorName(e) });

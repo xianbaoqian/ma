@@ -4,6 +4,11 @@ const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 const path = std.fs.path;
 
+pub const max_programs = 256;
+pub const max_state_env_mappings_per_program = 16;
+pub const max_accounts_per_program = 4096;
+pub const manifest_read_limit = 1 << 20;
+
 pub const Pair = struct { name: []const u8, dir: []const u8 };
 pub const Program = struct { name: []const u8, binary: []const u8, pairs: []Pair };
 pub const Parsed = struct { program: *const Program, id: u32, account: []const u8 };
@@ -26,7 +31,7 @@ fn die(ctx: Context, comptime fmt: []const u8, args: anytype) noreturn {
 /// Join path fragments using the allocator in the manifest context.
 /// Example: join(ctx, &.{"/accounts", "programs.conf"}) returns "/accounts/programs.conf".
 fn join(ctx: Context, parts: []const []const u8) []const u8 {
-    return path.join(ctx.gpa, parts) catch die(ctx, "out of memory", .{});
+    return path.join(ctx.gpa, parts) catch die(ctx, "static workspace exhausted", .{});
 }
 
 /// Find the install root that contains `ma`, `programs.conf`, and account folders.
@@ -34,7 +39,7 @@ fn join(ctx: Context, parts: []const []const u8) []const u8 {
 pub fn installRoot(io: Io, gpa: Allocator, env: *std.process.Environ.Map) []const u8 {
     if (env.get("MA_HOME")) |h| return gpa.dupe(u8, h) catch {
         var buf: [64]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "ma: out of memory\n", .{}) catch "ma: error\n";
+        const s = std.fmt.bufPrint(&buf, "ma: static workspace exhausted\n", .{}) catch "ma: error\n";
         std.Io.File.stderr().writeStreamingAll(io, s) catch {};
         std.process.exit(1);
     };
@@ -50,7 +55,7 @@ pub fn installRoot(io: Io, gpa: Allocator, env: *std.process.Environ.Map) []cons
 /// Example: "claude | claude | CLAUDE_CONFIG_DIR=.claude" becomes one Program.
 pub fn load(ctx: Context) []Program {
     const file = join(ctx, &.{ ctx.root, "programs.conf" });
-    const data = Dir.cwd().readFileAlloc(ctx.io, file, ctx.gpa, .limited(1 << 20)) catch |e|
+    const data = Dir.cwd().readFileAlloc(ctx.io, file, ctx.gpa, .limited(manifest_read_limit)) catch |e|
         die(ctx, "cannot read manifest '{s}': {s}", .{ file, @errorName(e) });
 
     var list: std.ArrayList(Program) = .empty;
@@ -64,7 +69,7 @@ pub fn load(ctx: Context) []Program {
         const binary = std.mem.trim(u8, fields.next() orelse
             die(ctx, "manifest line missing binary: '{s}'", .{line}), " \t");
         const pairs_field = std.mem.trim(u8, fields.next() orelse
-            die(ctx, "manifest line missing VAR=dir pairs: '{s}'", .{line}), " \t");
+            die(ctx, "manifest line missing state env mappings (VAR=dir): '{s}'", .{line}), " \t");
         if (name.len == 0 or binary.len == 0)
             die(ctx, "manifest line has empty name or binary: '{s}'", .{line});
 
@@ -75,19 +80,23 @@ pub fn load(ctx: Context) []Program {
                 die(ctx, "manifest pair '{s}' is not VAR=dir (line: '{s}')", .{ tok, line });
             if (eq == 0 or eq == tok.len - 1)
                 die(ctx, "manifest pair '{s}' has empty side (line: '{s}')", .{ tok, line });
+            if (pairs.items.len == max_state_env_mappings_per_program)
+                die(ctx, "program '{s}' has too many state env mappings for one command to load (max {d}; disk storage is not limited)", .{ name, max_state_env_mappings_per_program });
             pairs.append(ctx.gpa, .{ .name = tok[0..eq], .dir = tok[eq + 1 ..] }) catch
-                die(ctx, "out of memory", .{});
+                die(ctx, "static workspace exhausted", .{});
         }
-        if (pairs.items.len == 0) die(ctx, "program '{s}' has no VAR=dir pairs", .{name});
+        if (pairs.items.len == 0) die(ctx, "program '{s}' has no state env mappings (VAR=dir)", .{name});
+        if (list.items.len == max_programs)
+            die(ctx, "too many programs for one command to load (max {d}; disk storage is not limited)", .{max_programs});
 
         list.append(ctx.gpa, .{
             .name = name,
             .binary = binary,
-            .pairs = pairs.toOwnedSlice(ctx.gpa) catch die(ctx, "out of memory", .{}),
-        }) catch die(ctx, "out of memory", .{});
+            .pairs = pairs.toOwnedSlice(ctx.gpa) catch die(ctx, "static workspace exhausted", .{}),
+        }) catch die(ctx, "static workspace exhausted", .{});
     }
     if (list.items.len == 0) die(ctx, "manifest is empty", .{});
-    return list.toOwnedSlice(ctx.gpa) catch die(ctx, "out of memory", .{});
+    return list.toOwnedSlice(ctx.gpa) catch die(ctx, "static workspace exhausted", .{});
 }
 
 /// Find a configured program by command name.
@@ -153,8 +162,12 @@ pub fn forEachAccount(
     var dir = Dir.cwd().openDir(ctx.io, ctx.root, .{ .iterate = true }) catch |e|
         die(ctx, "cannot open install dir '{s}': {s}", .{ ctx.root, @errorName(e) });
     var it = dir.iterate();
+    var count: usize = 0;
     while (it.next(ctx.io) catch |e| die(ctx, "cannot scan directory: {s}", .{@errorName(e)})) |entry| {
         if (entry.kind != .directory or !isAccountFolder(prog, entry.name)) continue;
+        if (count == max_accounts_per_program)
+            die(ctx, "too many '{s}' accounts for one command to scan in RAM (max {d}; disk storage is not limited)", .{ prog.name, max_accounts_per_program });
+        count += 1;
         const p = parse(ctx, programs, entry.name);
         if (p.program != prog) continue;
         f(user_ctx, entry.name, p);

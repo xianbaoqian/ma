@@ -132,11 +132,78 @@ ma opencode ps
 The table shows the account, session id, last seen time, start time, duration, and topic.
 For opencode, `ma` asks `opencode db --format tsv` under each account's environment.
 
+## Rotate subscription logins
+
+For Codex and Claude, each `ma` profile/account can hold multiple subscription OAuth/device
+logins. Rotation swaps the active token for that profile without touching settings, history,
+sessions, or plugins:
+
+```sh
+ma auth add codex work sub1       # runs: codex login --device-auth
+ma auth add codex work            # adds another token under the same profile
+ma auth ls codex work             # show stored tokens without printing secrets
+ma auth rotate codex work         # swaps to the next stored auth.json
+ma auth check codex work --prune  # test tokens and remove broken ones
+ma auth remove codex work sub1    # delete one stored token
+ma auth clear codex work          # delete all stored tokens for this profile
+
+ma auth add claude work sub1      # runs: claude auth login --claudeai
+ma auth add claude work           # adds another Claude subscription OAuth login
+ma auth ls claude work
+ma auth rotate claude work
+```
+
+The login tokens live under the account state folder in `ma-auth/`, and rotation metadata
+is stored in `ma-auth/state.tsv`. Codex stores `auth.json`; Claude stores refresh-capable
+subscription OAuth credentials in `.credentials.json` under each token slot and launches
+Claude with `CLAUDE_SECURESTORAGE_CONFIG_DIR` pointed at the selected slot. For Claude child
+processes, `ma` also puts a small private `security` shim first in `PATH`, so Claude's macOS
+Keychain calls fail and Claude uses its file-backed secure-storage fallback. It does not use
+`claude setup-token` or `CLAUDE_CODE_OAUTH_TOKEN`, because those long-lived setup tokens are
+inference-only and do not support the full interactive Claude session. Shared config,
+projects, history, sessions, and plugins stay in place. If there is only one account for the
+program, the account name can be omitted. If the auth slot name is omitted, `ma` names the
+token from the inferred user identity, such as an email address; repeated identities get
+`-2`, `-3`, and so on. Existing older `default` slots continue to work only if they contain
+refresh-capable credential files. Explicit slot names are only for cases where you want to
+name a token yourself. If a new login produces the same stored credential as an existing
+token, `ma` refuses it and leaves the current token selected.
+
+`ma auth ls` reads only local files and shows the current marker, token slot name, a short
+fingerprint, inferred identity when available, and add/rotate times. `ma auth check` asks
+the underlying tool to validate each stored login, then makes a small non-interactive
+provider ping. It reports `ok`, `limit`, `bad`, or `unk`; with `--prune`, only clearly
+invalid auth (`bad`) is removed from `ma-auth/`. Quota-limited and inconclusive logins are
+kept and are printed as `kept`.
+Claude token metadata is saved as a sanitized `.claude.json` artifact with selected
+OAuth account fields only. Rotation writes only those selected `oauthAccount` fields and
+the selected `.credentials.json` back to the shared `.claude/` directory; other Claude
+settings remain in place. If Claude stores OAuth only in macOS Keychain and does not write
+`.credentials.json` into the selected slot even with the Keychain shim, `ma auth add claude
+...` fails immediately because that login cannot be rotated as a file-backed token.
+
+Auth rotation is subscription-only: API-key auth or credential environment variables such
+as `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are blocked because they cannot fall back the
+same way. If every stored login was rotated within the last 10 minutes, `ma auth rotate`
+warns and exits so you can double-check usage or rest.
+
+`ma` uses a fixed RAM workspace for each command. Files on disk are not capped by these
+numbers, but one invocation will load at most 4096 accounts per program, 4096 auth tokens
+per profile, 4096 session rows, and 16 state env mappings per program line in
+`programs.conf`. If a command hits one of those bounds, the error says it is a per-command
+RAM/load limit and leaves the stored files alone.
+
 ## The commands
 
 | command | what it does |
 | --- | --- |
 | `ma new PROGRAM ACCOUNT` | create a new isolated account folder |
+| `ma auth add PROGRAM [ACCOUNT] [TOKEN]` | add a Codex/Claude subscription login token |
+| `ma auth ls PROGRAM [ACCOUNT]` | list stored auth tokens and local metadata |
+| `ma auth rotate PROGRAM [ACCOUNT]` | rotate to the next stored subscription login |
+| `ma auth check PROGRAM [ACCOUNT] [--prune]` | validate stored auth tokens and optionally remove broken ones |
+| `ma auth remove PROGRAM [ACCOUNT] TOKEN` | remove one stored auth token |
+| `ma auth clear PROGRAM [ACCOUNT]` | remove all stored auth tokens for a profile |
 | `ma PROGRAM NAME` | run that account (everything after is passed through) |
 | `ma PROGRAM ID` | same, but pick the account by its number |
 | `ma PROGRAM ps` | list this folder's Claude, Codex, or opencode sessions |
@@ -151,13 +218,13 @@ launcher named after the tool, e.g. `./claude-1-work/claude`.
 Tools are listed in `programs.conf`. To support a new one, add a single line:
 
 ```
-# name | binary | VAR=dir pairs (space-separated)
+# name | binary | state env mappings (VAR=dir, space-separated)
 gemini | gemini | GEMINI_CONFIG_DIR=.gemini
 ```
 
 - **name** is what you type on the command line and what shows up in folder names.
 - **binary** is the actual program to run (found on your `PATH`).
-- **VAR=dir** points the tool's config environment variable at a folder inside the account.
+- **VAR=dir** is a state env mapping: it points the tool's config environment variable at a folder inside the account.
   The included tools already work; most CLIs have a variable like this.
 
 That's all. Existing accounts pick up the change the next time you launch them.
@@ -244,8 +311,8 @@ non-ASCII account names.
 
 Per-account logins sit in the dotfile folders inside each account (`.claude/`, `.codex/`,
 …). The included `.gitignore` keeps those out of version control — only the tool itself is
-ever committed. `ma` never reads or copies your credentials; it only sets environment
-variables and launches the real tool.
+ever committed. Auth rotation reads and copies only the credential artifacts needed for the
+selected program; `ma auth ls` prints fingerprints and inferred identities, not secrets.
 
 ## License
 

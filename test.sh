@@ -88,22 +88,101 @@ ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$ROOT/zig-local}" \
 
 cat > "$FAKEBIN/claude" <<'SH'
 #!/bin/sh
-: "${MA_TEST_LOG:?MA_TEST_LOG is required}"
-{
-  printf 'program=claude\n'
-  printf 'CLAUDE_CONFIG_DIR=%s\n' "$CLAUDE_CONFIG_DIR"
-  printf 'args=%s\n' "$*"
-} >> "$MA_TEST_LOG"
+if [ -n "${MA_TEST_LOG:-}" ]; then
+  {
+    printf 'program=claude\n'
+    printf 'CLAUDE_CONFIG_DIR=%s\n' "$CLAUDE_CONFIG_DIR"
+    printf 'CLAUDE_SECURESTORAGE_CONFIG_DIR=%s\n' "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}"
+    printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+    printf 'PATH=%s\n' "$PATH"
+    printf 'args=%s\n' "$*"
+  } >> "$MA_TEST_LOG"
+fi
+if [ "${1:-}" = auth ] && [ "${2:-}" = login ]; then
+  token_id="${MA_TEST_CLAUDE_TOKEN:-$MA_TEST_CLAUDE_VARIANT}"
+  cred="$(printf '{"claudeAiOauth":{"accessToken":"access-%s","refreshToken":"refresh-%s","expiresAt":9999999999999,"scopes":["user:profile","user:inference"]}}' "$token_id" "$token_id")"
+  hex="$(printf '%s' "$cred" | od -An -tx1 | tr -d ' \n')"
+  printf 'add-generic-password -U -a "%s" -s "Claude Code-test" -X "%s"\n' "${USER:-claude-code-user}" "$hex" | security -i >/dev/null 2>&1 || :
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  printf '{"oauthAccount":{"kind":"subscription","emailAddress":"%s@example.test","displayName":"%s","variant":"%s"},"projects":{"keep":true},"theme":"stable"}\n' "$MA_TEST_CLAUDE_VARIANT" "$MA_TEST_CLAUDE_VARIANT" "$MA_TEST_CLAUDE_VARIANT" \
+    > "$CLAUDE_CONFIG_DIR/.claude.json"
+fi
+if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+  security find-generic-password -a "${USER:-claude-code-user}" -w -s "Claude Code-test" >/dev/null 2>&1 || :
+  cred="$CLAUDE_SECURESTORAGE_CONFIG_DIR/.credentials.json"
+  if grep -F '"refreshToken":"refresh-broken"' "$cred" >/dev/null 2>&1; then
+    printf '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}\n'
+    exit 1
+  fi
+  test -f "$cred" || exit 1
+  printf '{"loggedIn":true,"authMethod":"oauth","apiProvider":"firstParty"}\n'
+fi
+if [ "${1:-}" = --safe-mode ]; then
+  cred="$CLAUDE_SECURESTORAGE_CONFIG_DIR/.credentials.json"
+  if grep -F '"refreshToken":"refresh-deadping"' "$cred" >/dev/null 2>&1; then
+    printf 'nope\n'
+    exit 0
+  fi
+  if grep -F '"refreshToken":"refresh-limited"' "$cred" >/dev/null 2>&1; then
+    printf 'You'\''ve hit your weekly limit · resets Jun 27 at 10am (Asia/Shanghai)\n'
+    exit 0
+  fi
+  if grep -F '"refreshToken":"refresh-' "$cred" >/dev/null 2>&1; then
+    printf 'pong\n'
+    exit 0
+  fi
+  exit 1
+fi
 SH
 
 cat > "$FAKEBIN/codex" <<'SH'
 #!/bin/sh
-: "${MA_TEST_LOG:?MA_TEST_LOG is required}"
-{
-  printf 'program=codex\n'
-  printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
-  printf 'args=%s\n' "$*"
-} >> "$MA_TEST_LOG"
+b64url() {
+  base64 | tr '+/' '-_' | tr -d '=\n'
+}
+if [ -n "${MA_TEST_LOG:-}" ]; then
+  {
+    printf 'program=codex\n'
+    printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
+    printf 'args=%s\n' "$*"
+  } >> "$MA_TEST_LOG"
+fi
+if [ "${1:-}" = login ] && [ "${2:-}" = --device-auth ]; then
+  mkdir -p "$CODEX_HOME"
+  variant="$(basename "$CODEX_HOME")"
+  header="$(printf '{"alg":"none"}' | b64url)"
+  user="${MA_TEST_CODEX_USER:-$variant@example.test}"
+  if [ -n "${MA_TEST_CODEX_TOKEN:-}" ]; then
+    token_id="$MA_TEST_CODEX_TOKEN"
+  elif [ "$variant" = .new-token ]; then
+    token_id="$variant-$$"
+  else
+    token_id="$variant"
+  fi
+  payload="$(printf '{"email":"%s","sub":"acct-%s"}' "$user" "$token_id" | b64url)"
+  printf '{"auth_mode":"chatgpt","kind":"subscription","variant":"%s","tokens":{"id_token":"%s.%s.","refresh_token":"refresh-%s","account_id":"acct-%s"}}\n' "$variant" "$header" "$payload" "$token_id" "$token_id" \
+    > "$CODEX_HOME/auth.json"
+fi
+if [ "${1:-}" = login ] && [ "${2:-}" = status ]; then
+  if grep -F '"variant":"broken"' "$CODEX_HOME/auth.json" >/dev/null 2>&1; then
+    printf 'not logged in\n'
+    exit 1
+  fi
+  test -f "$CODEX_HOME/auth.json" || exit 1
+  printf 'Logged in using ChatGPT\n'
+fi
+if [ "${1:-}" = exec ]; then
+  if grep -F '"variant":"deadping"' "$CODEX_HOME/auth.json" >/dev/null 2>&1; then
+    printf 'nope\n'
+    exit 0
+  fi
+  if grep -F '"variant":"limited"' "$CODEX_HOME/auth.json" >/dev/null 2>&1; then
+    printf 'usage limit reached; resets soon\n'
+    exit 0
+  fi
+  test -f "$CODEX_HOME/auth.json" || exit 1
+  printf 'pong\n'
+fi
 SH
 
 chmod +x "$FAKEBIN/claude" "$FAKEBIN/codex"
@@ -112,6 +191,12 @@ run_ma new claude cn >/dev/null
 run_ma new codex inferact >/dev/null
 run_ma new codex cn >/dev/null
 say "creates isolated account folders"
+
+if run_ma help $(seq 1 4097) > "$CASE/argv.out" 2> "$CASE/argv.err"; then
+  die "expected oversized argv to fail"
+fi
+assert_grep "$CASE/argv.err" "too many command arguments for one request"
+say "validates oversized argv before dispatch"
 
 mkdir -p "$HOME_DIR/.claude/projects/-tmp-work/$CLAUDE_ID"
 cat > "$HOME_DIR/.claude/projects/-tmp-work/$CLAUDE_ID.jsonl" <<EOF2
@@ -245,5 +330,210 @@ assert_grep "$CASE/codex-ps.out" "$CODEX_PS_ID"
 assert_grep "$CASE/codex-ps.out" "codex ps topic"
 assert_grep "$CASE/codex-ps.out" "4m00s"
 say "lists current-folder sessions across Claude and Codex accounts"
+
+run_ma_logged auth add codex cn sub1 >/dev/null
+assert_file "$ROOT/codex-2-cn/.codex/ma-auth/sub1/auth.json"
+assert_file "$ROOT/codex-2-cn/.codex/auth.json"
+assert_grep "$LOG" "CODEX_HOME=$ROOT/codex-2-cn/.codex/ma-auth/sub1"
+assert_grep "$LOG" "args=login --device-auth"
+run_ma_logged auth add codex cn sub2 >/dev/null
+if ( MA_TEST_CODEX_TOKEN=sub1 run_ma_logged auth add codex cn subdup ) > "$CASE/codex-dup.out" 2> "$CASE/codex-dup.err"; then
+  die "expected duplicate Codex token add to fail"
+fi
+assert_grep "$CASE/codex-dup.err" "same auth token"
+assert_no_file "$ROOT/codex-2-cn/.codex/ma-auth/subdup/auth.json"
+run_ma auth rotate codex cn >/dev/null
+assert_grep "$ROOT/codex-2-cn/.codex/auth.json" '"variant":"sub2"'
+run_ma auth rotate codex cn >/dev/null
+assert_grep "$ROOT/codex-2-cn/.codex/auth.json" '"variant":"sub1"'
+if run_ma auth rotate codex cn > "$CASE/codex-rotate.out" 2> "$CASE/codex-rotate.err"; then
+  die "expected rapid Codex rotation warning"
+fi
+assert_grep "$CASE/codex-rotate.err" "all codex auth tokens"
+run_ma_logged auth check codex cn > "$CASE/codex-check.out"
+assert_grep "$CASE/codex-check.out" "ok"
+assert_grep "$LOG" "args=exec --ephemeral --skip-git-repo-check --ignore-rules --ignore-user-config --sandbox read-only Reply exactly with the single word: pong"
+run_ma auth ls codex cn > "$CASE/codex-ls.out"
+assert_grep "$CASE/codex-ls.out" "auth tokens"
+assert_grep "$CASE/codex-ls.out" "*   sub1"
+assert_grep "$CASE/codex-ls.out" "sub1@example.test"
+mkdir -p "$ROOT/codex-2-cn/.codex/ma-auth/deadping"
+printf '{"kind":"subscription","variant":"deadping","tokens":{"refresh_token":"refresh-deadping","account_id":"acct-deadping"}}\n' > "$ROOT/codex-2-cn/.codex/ma-auth/deadping/auth.json"
+printf 'variant\tdeadping\t0\t0\tlogin\n' >> "$ROOT/codex-2-cn/.codex/ma-auth/state.tsv"
+mkdir -p "$ROOT/codex-2-cn/.codex/ma-auth/limited"
+printf '{"kind":"subscription","variant":"limited","tokens":{"refresh_token":"refresh-limited","account_id":"acct-limited"}}\n' > "$ROOT/codex-2-cn/.codex/ma-auth/limited/auth.json"
+printf 'variant\tlimited\t0\t0\tlogin\n' >> "$ROOT/codex-2-cn/.codex/ma-auth/state.tsv"
+mkdir -p "$ROOT/codex-2-cn/.codex/ma-auth/broken"
+printf '{"kind":"subscription","variant":"broken"}\n' > "$ROOT/codex-2-cn/.codex/ma-auth/broken/auth.json"
+printf 'variant\tbroken\t0\t0\tlogin\n' >> "$ROOT/codex-2-cn/.codex/ma-auth/state.tsv"
+if run_ma auth check codex cn --prune > "$CASE/codex-prune.out"; then
+  die "expected Codex prune check to report a failed variant"
+fi
+assert_grep "$CASE/codex-prune.out" "bad"
+assert_grep "$CASE/codex-prune.out" "deadping"
+assert_grep "$CASE/codex-prune.out" "unk"
+assert_grep "$CASE/codex-prune.out" "provider ping inconclusive; auth not pruned"
+assert_grep "$CASE/codex-prune.out" "limited"
+assert_grep "$CASE/codex-prune.out" "limit"
+assert_grep "$CASE/codex-prune.out" "auth valid; provider reports usage limit"
+assert_grep "$CASE/codex-prune.out" "kept"
+assert_grep "$CASE/codex-prune.out" "pruned"
+assert_file "$ROOT/codex-2-cn/.codex/ma-auth/deadping/auth.json"
+assert_file "$ROOT/codex-2-cn/.codex/ma-auth/limited/auth.json"
+assert_no_file "$ROOT/codex-2-cn/.codex/ma-auth/broken/auth.json"
+assert_grep "$ROOT/codex-2-cn/.codex/auth.json" '"variant":"sub1"'
+run_ma auth remove codex cn deadping >/dev/null
+run_ma auth remove codex cn limited >/dev/null
+run_ma auth remove codex cn sub2 >/dev/null
+assert_no_file "$ROOT/codex-2-cn/.codex/ma-auth/sub2/auth.json"
+assert_grep "$ROOT/codex-2-cn/.codex/auth.json" '"variant":"sub1"'
+if run_ma auth remove codex cn sub1 > "$CASE/codex-remove-last.out" 2> "$CASE/codex-remove-last.err"; then
+  die "expected removing the last Codex token to require clear"
+fi
+assert_grep "$CASE/codex-remove-last.err" "use 'ma auth clear codex cn'"
+assert_file "$ROOT/codex-2-cn/.codex/ma-auth/sub1/auth.json"
+run_ma auth clear codex cn >/dev/null
+assert_no_file "$ROOT/codex-2-cn/.codex/ma-auth/state.tsv"
+assert_no_file "$ROOT/codex-2-cn/.codex/auth.json"
+say "adds, rotates, removes, and clears Codex device auth tokens"
+
+printf '{"theme":"stable"}\n' > "$ROOT/claude-1-cn/.claude/settings.json"
+MA_TEST_CLAUDE_VARIANT=csub1 run_ma_logged auth add claude cn csub1 >/dev/null
+assert_file "$ROOT/claude-1-cn/.claude/ma-auth/csub1/.credentials.json"
+assert_file "$ROOT/claude-1-cn/.claude/ma-auth/csub1/.claude.json"
+assert_grep "$ROOT/claude-1-cn/.claude/ma-auth/csub1/.credentials.json" '"refreshToken":"refresh-csub1"'
+assert_grep "$ROOT/claude-1-cn/.claude/.credentials.json" '"refreshToken":"refresh-csub1"'
+assert_grep "$ROOT/claude-1-cn/.claude/ma-auth/csub1/.claude.json" 'csub1@example.test'
+assert_grep "$LOG" "CLAUDE_CONFIG_DIR=$ROOT/claude-1-cn/.claude"
+assert_grep "$LOG" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROOT/claude-1-cn/.claude/ma-auth/csub1"
+assert_grep "$LOG" "PATH=$ROOT/claude-1-cn/.claude/ma-auth/.ma-file-auth-bin:"
+assert_grep "$LOG" "args=auth login --claudeai"
+assert_grep "$ROOT/claude-1-cn/.claude/ma-auth/.ma-file-auth-bin/security.log" "find-generic-password"
+assert_grep "$ROOT/claude-1-cn/.claude/ma-auth/.ma-file-auth-bin/security.log" "add-generic-password"
+MA_TEST_CLAUDE_VARIANT=csub2 run_ma_logged auth add claude cn csub2 >/dev/null
+if ( MA_TEST_CLAUDE_VARIANT=csubdup MA_TEST_CLAUDE_TOKEN=csub1 run_ma_logged auth add claude cn csubdup ) > "$CASE/claude-dup.out" 2> "$CASE/claude-dup.err"; then
+  die "expected duplicate Claude token add to fail"
+fi
+assert_grep "$CASE/claude-dup.err" "same auth token"
+assert_no_file "$ROOT/claude-1-cn/.claude/ma-auth/csubdup/.credentials.json"
+assert_grep "$ROOT/claude-1-cn/.claude/.claude.json" "csub1@example.test"
+run_ma_logged claude cn ping-after-add >/dev/null
+assert_grep "$LOG" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROOT/claude-1-cn/.claude/ma-auth/csub1"
+assert_grep "$LOG" "CLAUDE_CODE_OAUTH_TOKEN="
+assert_grep "$LOG" "PATH=$ROOT/claude-1-cn/.claude/ma-auth/.ma-file-auth-bin:"
+printf '{"oauthAccount":{"kind":"subscription","emailAddress":"shared@example.test","displayName":"Shared User"},"projects":{"keep":true}}\n' \
+  > "$ROOT/claude-1-cn/.claude/.claude.json"
+run_ma auth rotate claude cn >/dev/null
+run_ma_logged claude cn ping-after-rotate >/dev/null
+assert_grep "$LOG" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROOT/claude-1-cn/.claude/ma-auth/csub2"
+assert_grep "$ROOT/claude-1-cn/.claude/.credentials.json" '"refreshToken":"refresh-csub2"'
+assert_grep "$ROOT/claude-1-cn/.claude/.claude.json" "csub2@example.test"
+assert_grep "$ROOT/claude-1-cn/.claude/settings.json" '"theme":"stable"'
+run_ma_logged auth check claude cn > "$CASE/claude-check.out"
+assert_grep "$CASE/claude-check.out" "ok"
+assert_grep "$LOG" "PATH=$ROOT/claude-1-cn/.claude/ma-auth/.ma-file-auth-bin:"
+assert_grep "$LOG" "args=--safe-mode --no-session-persistence --output-format text --permission-mode dontAsk --tools  -p Reply exactly with the single word: pong"
+assert_grep "$ROOT/claude-1-cn/.claude/ma-auth/.ma-file-auth-bin/security.log" "find-generic-password"
+run_ma auth ls claude cn > "$CASE/claude-ls.out"
+assert_grep "$CASE/claude-ls.out" "oauth:"
+assert_grep "$CASE/claude-ls.out" "csub1@example.test"
+mkdir -p "$ROOT/claude-1-cn/.claude/ma-auth/placeholder"
+printf '<token>\n' > "$ROOT/claude-1-cn/.claude/ma-auth/placeholder/.oauth_token"
+printf 'variant\tplaceholder\t0\t0\tlogin\n' >> "$ROOT/claude-1-cn/.claude/ma-auth/state.tsv"
+if run_ma auth check claude cn > "$CASE/claude-placeholder-check.out"; then
+  die "expected Claude placeholder token to fail local credential check"
+fi
+assert_grep "$CASE/claude-placeholder-check.out" "placeholder"
+assert_grep "$CASE/claude-placeholder-check.out" "missing .credentials.json"
+mkdir -p "$ROOT/claude-1-cn/.claude/ma-auth/deadping"
+printf '{"claudeAiOauth":{"accessToken":"access-deadping","refreshToken":"refresh-deadping"}}\n' > "$ROOT/claude-1-cn/.claude/ma-auth/deadping/.credentials.json"
+printf 'variant\tdeadping\t0\t0\tlogin\n' >> "$ROOT/claude-1-cn/.claude/ma-auth/state.tsv"
+mkdir -p "$ROOT/claude-1-cn/.claude/ma-auth/limited"
+printf '{"claudeAiOauth":{"accessToken":"access-limited","refreshToken":"refresh-limited"}}\n' > "$ROOT/claude-1-cn/.claude/ma-auth/limited/.credentials.json"
+printf 'variant\tlimited\t0\t0\tlogin\n' >> "$ROOT/claude-1-cn/.claude/ma-auth/state.tsv"
+mkdir -p "$ROOT/claude-1-cn/.claude/ma-auth/broken"
+printf '{"claudeAiOauth":{"accessToken":"access-broken","refreshToken":"refresh-broken"}}\n' > "$ROOT/claude-1-cn/.claude/ma-auth/broken/.credentials.json"
+printf 'variant\tbroken\t0\t0\tlogin\n' >> "$ROOT/claude-1-cn/.claude/ma-auth/state.tsv"
+if run_ma auth check claude cn --prune > "$CASE/claude-prune.out"; then
+  die "expected Claude prune check to report a failed variant"
+fi
+assert_grep "$CASE/claude-prune.out" "bad"
+assert_grep "$CASE/claude-prune.out" "deadping"
+assert_grep "$CASE/claude-prune.out" "unk"
+assert_grep "$CASE/claude-prune.out" "provider ping inconclusive; auth not pruned"
+assert_grep "$CASE/claude-prune.out" "limited"
+assert_grep "$CASE/claude-prune.out" "limit"
+assert_grep "$CASE/claude-prune.out" "auth valid; provider reports usage limit"
+assert_grep "$CASE/claude-prune.out" "kept"
+assert_grep "$CASE/claude-prune.out" "pruned"
+assert_file "$ROOT/claude-1-cn/.claude/ma-auth/deadping/.credentials.json"
+assert_file "$ROOT/claude-1-cn/.claude/ma-auth/limited/.credentials.json"
+assert_no_file "$ROOT/claude-1-cn/.claude/ma-auth/broken/.credentials.json"
+run_ma auth remove claude cn deadping >/dev/null
+run_ma auth remove claude cn limited >/dev/null
+run_ma auth remove claude cn csub1 >/dev/null
+assert_no_file "$ROOT/claude-1-cn/.claude/ma-auth/csub1/.credentials.json"
+run_ma_logged claude cn ping-after-remove >/dev/null
+assert_grep "$LOG" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROOT/claude-1-cn/.claude/ma-auth/csub2"
+if run_ma auth remove claude cn csub2 > "$CASE/claude-remove-last.out" 2> "$CASE/claude-remove-last.err"; then
+  die "expected removing the last Claude token to require clear"
+fi
+assert_grep "$CASE/claude-remove-last.err" "use 'ma auth clear claude cn'"
+assert_file "$ROOT/claude-1-cn/.claude/ma-auth/csub2/.credentials.json"
+run_ma auth clear claude cn >/dev/null
+assert_no_file "$ROOT/claude-1-cn/.claude/ma-auth/state.tsv"
+assert_no_file "$ROOT/claude-1-cn/.claude/.credentials.json"
+run_ma_logged claude cn ping-after-clear >/dev/null
+assert_grep "$LOG" "CLAUDE_SECURESTORAGE_CONFIG_DIR="
+say "adds, rotates, removes, and clears Claude subscription OAuth tokens"
+
+run_ma new claude thorson >/dev/null
+printf '{"oauthAccount":{"kind":"subscription","variant":"existing"},"projects":{"keep":true}}\n' \
+  > "$ROOT/claude-3-thorson/.claude/.claude.json"
+MA_TEST_CLAUDE_VARIANT=default run_ma_logged auth add claude thorson >/dev/null
+assert_file "$ROOT/claude-3-thorson/.claude/ma-auth/default@example.test/.credentials.json"
+assert_grep "$ROOT/claude-3-thorson/.claude/ma-auth/default@example.test/.credentials.json" '"refreshToken":"refresh-default"'
+assert_grep "$LOG" "CLAUDE_CONFIG_DIR=$ROOT/claude-3-thorson/.claude"
+MA_TEST_CLAUDE_VARIANT=second run_ma_logged auth add claude thorson >/dev/null
+assert_file "$ROOT/claude-3-thorson/.claude/ma-auth/second@example.test/.credentials.json"
+assert_grep "$ROOT/claude-3-thorson/.claude/ma-auth/second@example.test/.credentials.json" '"refreshToken":"refresh-second"'
+run_ma auth rotate claude thorson >/dev/null
+run_ma_logged claude thorson ping-thorson-rotate >/dev/null
+assert_grep "$LOG" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROOT/claude-3-thorson/.claude/ma-auth/second@example.test"
+assert_grep "$ROOT/claude-3-thorson/.claude/.claude.json" "second@example.test"
+say "adds multiple Claude OAuth tokens under one profile"
+
+run_ma new claude pasted >/dev/null
+mkdir -p "$ROOT/claude-4-pasted/.claude/ma-auth/oauth-2"
+printf '<token>\n' > "$ROOT/claude-4-pasted/.claude/ma-auth/oauth-2/.oauth_token"
+printf '# ma auth state v1\ncurrent\toauth-2\nvariant\toauth-2\t0\t0\tlogin\n' \
+  > "$ROOT/claude-4-pasted/.claude/ma-auth/state.tsv"
+MA_TEST_CLAUDE_VARIANT=pasted run_ma_logged auth add claude pasted >/dev/null
+assert_file "$ROOT/claude-4-pasted/.claude/ma-auth/pasted@example.test/.credentials.json"
+assert_grep "$ROOT/claude-4-pasted/.claude/ma-auth/state.tsv" "current	pasted@example.test"
+run_ma_logged claude pasted ping-after-placeholder >/dev/null
+assert_grep "$LOG" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROOT/claude-4-pasted/.claude/ma-auth/pasted@example.test"
+say "replaces a bad Claude placeholder current token on add"
+
+if PATH="$FAKEBIN:$PATH" HOME="$HOME_DIR" MA_TEST_LOG="$LOG" OPENAI_API_KEY=sk-test \
+  "$ROOT/ma" auth add codex cn blocked > "$CASE/api-block.out" 2> "$CASE/api-block.err"; then
+  die "expected API-key auth add to be blocked"
+fi
+assert_grep "$CASE/api-block.err" "OPENAI_API_KEY is set"
+say "blocks API-key auth for subscription rotation"
+
+rm -rf "$ROOT/codex-1-inferact" "$ROOT/codex-2-cn"
+run_ma new codex solo >/dev/null
+MA_TEST_CODEX_USER=solo@example.test run_ma_logged auth add codex solo >/dev/null
+assert_no_file "$ROOT/codex-1-solo/.codex/ma-auth/.new-token/auth.json"
+assert_file "$ROOT/codex-1-solo/.codex/ma-auth/solo@example.test/auth.json"
+assert_grep "$ROOT/codex-1-solo/.codex/ma-auth/state.tsv" "current	solo@example.test"
+MA_TEST_CODEX_USER=solo@example.test run_ma_logged auth add codex solo >/dev/null
+assert_file "$ROOT/codex-1-solo/.codex/ma-auth/solo@example.test-2/auth.json"
+run_ma_logged auth add codex named >/dev/null
+assert_file "$ROOT/codex-1-solo/.codex/ma-auth/named/auth.json"
+assert_file "$ROOT/codex-1-solo/.codex/ma-auth/solo@example.test/auth.json"
+assert_file "$ROOT/codex-1-solo/.codex/ma-auth/solo@example.test-2/auth.json"
+say "auto-names auth tokens from inferred user identity"
 
 echo "all tests passed"

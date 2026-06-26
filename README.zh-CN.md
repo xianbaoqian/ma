@@ -122,6 +122,60 @@ ma opencode ps
 表格里会显示账号、session id、最后活跃时间、开始时间、持续时间和 topic。opencode 会在每个
 账号的环境里调用 `opencode db --format tsv` 查询。
 
+## 轮换订阅登录
+
+有时候你不是想建很多套配置，只是想给同一个账号文件夹准备几个可用的订阅登录。比如一个
+Claude 账号文件夹里已经有配置、历史记录和插件，你只想在用量满了以后换到下一个登录。
+
+`ma auth` 做的就是这件事：在同一个账号文件夹下面保存多个订阅登录，然后按顺序切换。轮换只换
+登录，不搬配置、历史记录、会话和插件。
+
+```sh
+ma auth add codex work            # 打开 codex login --device-auth，保存一个订阅登录
+ma auth add codex work            # 再保存一个
+ma auth ls codex work             # 看当前有哪些登录，不打印完整 token
+ma auth rotate codex work         # 切到下一个登录
+ma auth check codex work --prune  # 检查这些登录，只删明确坏掉的
+ma auth remove codex work sub1    # 删除其中一个
+ma auth clear codex work          # 清掉这个账号文件夹下面保存的所有登录
+
+ma auth add claude work           # 打开 claude auth login --claudeai，保存一个订阅登录
+ma auth add claude work           # 再保存一个
+ma auth ls claude work
+ma auth rotate claude work
+```
+
+如果只有一个 `work` 账号，账号名也可以省略。平时也不用自己给登录取名字；不写最后那个
+`TOKEN` 时，`ma` 会尽量用邮箱或用户名命名。名字重复时会自动加 `-2`、`-3`。如果新登录其实
+和已有登录是同一份，`ma` 会拒绝保存，避免你以为自己多了一个可轮换的登录。
+
+`ma auth ls` 只看本地文件，会告诉你当前用的是哪一个、能推断出的身份、什么时候添加、什么时候
+轮换过。`ma auth check` 会真的问一次底层工具能不能用。输出大概是这几类：
+
+- `ok`：登录可用
+- `limit`：登录是真的，但服务端说用量满了；这种不会被删
+- `bad`：登录已经坏了；加 `--prune` 时会删掉它
+- `unk`：没法判断；也不会随便删
+
+文件都放在这个账号自己的状态目录里。Codex 的登录保存成 `ma-auth/<name>/auth.json`。Claude 的
+登录保存成 `ma-auth/<name>/.credentials.json`，启动 Claude 时 `ma` 会让 Claude 使用当前选中的
+那一份。Claude 的设置、项目记录、历史、会话和插件还是留在共享的 `.claude/`
+目录里；轮换时只换登录和少量账号身份字段。
+
+这里特意不用 `claude setup-token`，也不用 `CLAUDE_CODE_OAUTH_TOKEN`。那类 token 可以发起推理请求，
+但不适合完整的交互式 Claude 会话。`ma` 要保存的是 Claude 自己可刷新的订阅 OAuth 登录；如果
+Claude 只把登录塞进 macOS Keychain，没有写出可轮换的 `.credentials.json`，`ma auth add claude ...`
+会直接失败。
+
+这个功能只支持订阅登录。`OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 这类 API key 会被拒绝，因为它们
+不是同一种登录，也没法按这个方式当备用登录切换。10 分钟内所有登录都轮换过时，`ma auth rotate` 会
+给出警告并退出，提醒你先看一下用量，别一直空转。
+
+`ma` 每次命令只加载固定数量的数据到内存；这不是磁盘文件数量上限。磁盘上可以继续放更多账号、
+登录和会话文件。单次命令最多加载每个程序 4096 个账号、每个账号文件夹 4096 个登录、
+4096 行会话列表，以及 `programs.conf` 每个程序 16 个状态目录映射。碰到边界时，错误
+会说明这是单次命令的加载上限，并且不会改动已经保存的文件。
+
 ## 添加新工具
 
 工具列表在 `programs.conf`。加新工具通常只要一行：
