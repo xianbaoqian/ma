@@ -815,17 +815,28 @@ fn apiKeyName(s: []const u8) bool {
         std.ascii.eqlIgnoreCase(s, "ANTHROPIC_API_KEY");
 }
 
+/// Return whether a JSON value is real API-key material.
+/// Example: "sk-..." returns true, null and "" return false.
+fn jsonHasApiKeyMaterial(v: std.json.Value) bool {
+    return switch (v) {
+        .string => |s| s.len != 0,
+        .null => false,
+        .bool => |b| b,
+        .array => |a| a.items.len != 0,
+        .object => |o| o.count() != 0,
+        else => true,
+    };
+}
+
 /// Recursively detect a non-empty API key field in parsed JSON.
-/// Example: {"api_key":"sk-..."} returns true.
+/// Example: {"api_key":"sk-..."} returns true; {"OPENAI_API_KEY":null} does not.
 fn jsonHasApiKey(v: std.json.Value) bool {
     switch (v) {
         .object => |o| {
             var it = o.iterator();
             while (it.next()) |entry| {
-                if (apiKeyName(entry.key_ptr.*)) switch (entry.value_ptr.*) {
-                    .string => |s| if (s.len != 0) return true,
-                    else => return true,
-                };
+                if (apiKeyName(entry.key_ptr.*) and jsonHasApiKeyMaterial(entry.value_ptr.*))
+                    return true;
                 if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "auth_method") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authMethod")) {
                     if (entry.value_ptr.* == .string and std.mem.indexOf(u8, entry.value_ptr.string, "api") != null) return true;
                 }

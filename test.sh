@@ -165,7 +165,7 @@ if [ "${1:-}" = login ] && [ "${2:-}" = --device-auth ]; then
     token_id="$variant"
   fi
   payload="$(printf '{"email":"%s","sub":"acct-%s"}' "$user" "$token_id" | b64url)"
-  printf '{"auth_mode":"chatgpt","kind":"subscription","variant":"%s","tokens":{"id_token":"%s.%s.sig","refresh_token":"refresh-%s","account_id":"acct-%s"}}\n' "$variant" "$header" "$payload" "$token_id" "$token_id" \
+  printf '{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","kind":"subscription","variant":"%s","tokens":{"id_token":"%s.%s.sig","refresh_token":"refresh-%s","account_id":"acct-%s"}}\n' "$variant" "$header" "$payload" "$token_id" "$token_id" \
     > "$CODEX_HOME/auth.json"
 fi
 if [ "${1:-}" = login ] && [ "${2:-}" = status ]; then
