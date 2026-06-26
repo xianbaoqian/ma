@@ -49,6 +49,7 @@ const AccountCount = struct { key: []const u8, key_id: ?u32, count: usize = 0 };
 
 const codex_artifacts = [_][]const u8{"auth.json"};
 const claude_artifacts = [_][]const u8{".credentials.json"};
+pub const codex_file_auth_override = "cli_auth_credentials_store=file";
 const codex_cred_env = [_][]const u8{ "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN" };
 const claude_cred_env = [_][]const u8{
     "ANTHROPIC_API_KEY",
@@ -268,6 +269,14 @@ fn removeFile(ctx: Context, p: []const u8) void {
     };
 }
 
+/// Return whether a path is a symlink.
+/// Example: live Codex auth.json is a symlink after ma rotation.
+fn isSymlink(ctx: Context, p: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    _ = Dir.cwd().readLink(ctx.io, p, &buf) catch return false;
+    return true;
+}
+
 /// Return a token with surrounding whitespace trimmed.
 /// Example: trimToken(" abc\n") returns "abc".
 fn trimToken(s: []const u8) []const u8 {
@@ -466,9 +475,35 @@ fn codexCredential(ctx: Context, dir: []const u8) ?[]const u8 {
     const v = readJsonObject(ctx, join(ctx, &.{ dir, "auth.json" })) orelse return null;
     const tokens = if (v.object.get("tokens")) |t| t else return null;
     if (tokens != .object) return null;
-    return jsonStringField(ctx, tokens, "refresh_token") orelse
+    return codexRefreshCredential(ctx, dir) orelse
         jsonStringField(ctx, tokens, "access_token") orelse
         jsonStringField(ctx, tokens, "id_token");
+}
+
+/// Return Codex's refresh-capable device-login credential from auth.json.
+/// Example: device auth writes tokens.refresh_token.
+fn codexRefreshCredential(ctx: Context, dir: []const u8) ?[]const u8 {
+    const v = readJsonObject(ctx, join(ctx, &.{ dir, "auth.json" })) orelse return null;
+    const tokens = if (v.object.get("tokens")) |t| t else return null;
+    if (tokens != .object) return null;
+    return jsonStringField(ctx, tokens, "refresh_token");
+}
+
+/// Return why a Codex auth slot is not a rotatable subscription/device login.
+/// Example: API keys and personal access tokens cannot fall back by auth rotation.
+fn codexAuthProblem(ctx: Context, dir: []const u8) ?[]const u8 {
+    const v = readJsonObject(ctx, join(ctx, &.{ dir, "auth.json" })) orelse return "missing auth.json";
+    if (hasApiKeyAuth(ctx, dir)) return "API-key auth is not rotatable";
+    if (v.object.get("personal_access_token")) |_| return "personal access token auth is not rotatable";
+    if (v.object.get("agent_identity")) |_| return "agent identity auth is not rotatable";
+    if (v.object.get("bedrock_api_key")) |_| return "Bedrock API-key auth is not rotatable";
+    if (v.object.get("auth_mode")) |mode| {
+        if (mode != .string) return "Codex auth has invalid auth_mode";
+        if (!std.ascii.eqlIgnoreCase(mode.string, "chatgpt"))
+            return "Codex auth is not a refresh-capable device login";
+    }
+    if (codexRefreshCredential(ctx, dir) == null) return "missing Codex refresh token";
+    return null;
 }
 
 /// Return Claude's refresh-capable local credential from .credentials.json.
@@ -728,6 +763,11 @@ fn probeClaudeFileAuth(ctx: Context, program: *const Program, login_dir: []const
 /// Apply a stored Claude OAuth storage slot to a launch environment, if configured.
 /// Example: current=work sets CLAUDE_SECURESTORAGE_CONFIG_DIR to ma-auth/work.
 pub fn applyLaunchEnv(ctx: Context, program: *const Program, account_dir: []const u8) void {
+    if (std.mem.eql(u8, program.name, "codex")) {
+        if (launchNeedsCodexFileAuthOverride(ctx, program, account_dir))
+            scrubCredentialEnv(ctx.env, program.name);
+        return;
+    }
     if (!std.mem.eql(u8, program.name, "claude")) return;
     _ = ctx.env.swapRemove(claude_secure_storage_env);
     const root = stateRoot(ctx, program, account_dir);
@@ -738,6 +778,16 @@ pub fn applyLaunchEnv(ctx: Context, program: *const Program, account_dir: []cons
     scrubCredentialEnv(ctx.env, program.name);
     applyClaudeFileAuth(ctx, ctx.env, root);
     ctx.env.put(claude_secure_storage_env, dir) catch die(ctx, "static workspace exhausted", .{});
+}
+
+/// Return whether Codex launch should force file-backed auth storage.
+/// Example: current ma-auth token needs refreshes to update auth.json, not keyring.
+pub fn launchNeedsCodexFileAuthOverride(ctx: Context, program: *const Program, account_dir: []const u8) bool {
+    if (!std.mem.eql(u8, program.name, "codex")) return false;
+    const root = stateRoot(ctx, program, account_dir);
+    const data = readOpt(ctx, statePath(ctx, root)) orelse return false;
+    const cur = currentFromState(data) orelse return false;
+    return variantUsableLocal(ctx, program.name, variantDir(ctx, root, cur));
 }
 
 /// Return whether any known auth artifact exists in a directory.
@@ -1119,7 +1169,7 @@ fn variantUsableLocal(ctx: Context, program: []const u8, variant_dir: []const u8
     }
     if (std.mem.eql(u8, program, "codex")) {
         if (!exists(ctx, join(ctx, &.{ variant_dir, "auth.json" }))) return false;
-        return !hasApiKeyAuth(ctx, variant_dir);
+        return codexAuthProblem(ctx, variant_dir) == null;
     }
     return false;
 }
@@ -1130,6 +1180,17 @@ fn currentUsableLocal(ctx: Context, program: []const u8, root: []const u8, st: S
     const cur = st.current orelse return false;
     if (variantIndex(st, cur) == null) return false;
     return variantUsableLocal(ctx, program, variantDir(ctx, root, cur));
+}
+
+/// Preserve a Codex refresh written to the live root by older non-symlink installs.
+/// Example: root/auth.json refreshed by Codex is copied back into ma-auth/current.
+fn syncLiveCodexCurrent(ctx: Context, program: []const u8, root: []const u8, st: State) void {
+    if (!std.mem.eql(u8, program, "codex")) return;
+    const cur = st.current orelse return;
+    if (variantIndex(st, cur) == null) return;
+    if (isSymlink(ctx, join(ctx, &.{ root, "auth.json" }))) return;
+    if (codexAuthProblem(ctx, root) != null) return;
+    copyFile(ctx, join(ctx, &.{ root, "auth.json" }), join(ctx, &.{ variantDir(ctx, root, cur), "auth.json" }));
 }
 
 /// Choose the current token if usable, otherwise the first locally usable slot.
@@ -1157,6 +1218,16 @@ fn installVariant(ctx: Context, program: []const u8, root: []const u8, src_dir: 
             die(ctx, "auth token '{s}' has no refresh-capable Claude OAuth credentials", .{path.basename(src_dir)});
         copyFile(ctx, join(ctx, &.{ src_dir, ".credentials.json" }), join(ctx, &.{ root, ".credentials.json" }));
         applyClaudeMetadata(ctx, root, src_dir);
+        return;
+    }
+    if (std.mem.eql(u8, program, "codex")) {
+        if (!variantUsableLocal(ctx, program, src_dir))
+            die(ctx, "auth token '{s}' has no refresh-capable Codex device auth", .{path.basename(src_dir)});
+        const dst = join(ctx, &.{ root, "auth.json" });
+        const rel = std.fmt.allocPrint(ctx.gpa, "ma-auth/{s}/auth.json", .{path.basename(src_dir)}) catch die(ctx, "static workspace exhausted", .{});
+        removeFile(ctx, dst);
+        Dir.cwd().symLink(ctx.io, rel, dst, .{}) catch |e|
+            die(ctx, "cannot select Codex auth token '{s}': {s}", .{ path.basename(src_dir), @errorName(e) });
         return;
     }
     var copied = false;
@@ -1379,8 +1450,8 @@ fn checkClaudeVariant(ctx: Context, program: *const Program, root: []const u8, v
 fn checkCodexVariant(ctx: Context, program: *const Program, variant_dir: []const u8) CheckResult {
     if (!exists(ctx, join(ctx, &.{ variant_dir, "auth.json" })))
         return .{ .status = .invalid, .message = "missing auth.json" };
-    if (hasApiKeyAuth(ctx, variant_dir))
-        return .{ .status = .invalid, .identity = inferCodexIdentity(ctx, variant_dir), .message = "API-key auth is not rotatable" };
+    if (codexAuthProblem(ctx, variant_dir)) |problem|
+        return .{ .status = .invalid, .identity = inferCodexIdentity(ctx, variant_dir), .message = problem };
     const identity = inferCodexIdentity(ctx, variant_dir);
     var child_env = ctx.env.clone(ctx.gpa) catch die(ctx, "static workspace exhausted", .{});
     scrubCredentialEnv(&child_env, program.name);
@@ -1388,7 +1459,7 @@ fn checkCodexVariant(ctx: Context, program: *const Program, variant_dir: []const
     child_env.put("NO_COLOR", "1") catch die(ctx, "static workspace exhausted", .{});
     child_env.put("TERM", "dumb") catch die(ctx, "static workspace exhausted", .{});
 
-    const status_argv = [_][]const u8{ program.binary, "login", "status" };
+    const status_argv = [_][]const u8{ program.binary, "-c", codex_file_auth_override, "login", "status" };
     const status = runCheckProcess(ctx, &status_argv, &child_env, check_timeout);
     if (status.status != .ok) {
         var res = statusFailure(ctx, "status failed", status);
@@ -1398,6 +1469,8 @@ fn checkCodexVariant(ctx: Context, program: *const Program, variant_dir: []const
 
     const ping_argv = [_][]const u8{
         program.binary,
+        "-c",
+        codex_file_auth_override,
         "exec",
         "--ephemeral",
         "--skip-git-repo-check",
@@ -1505,6 +1578,10 @@ fn captureArtifacts(ctx: Context, program: []const u8, login_dir: []const u8, ds
         die(ctx, "{s} login finished but did not write subscription auth files under '{s}'", .{ program, login_dir });
     if (hasApiKeyAuth(ctx, dst_dir))
         die(ctx, "{s} login wrote API-key auth; ma auth only supports subscription/device logins", .{program});
+    if (std.mem.eql(u8, program, "codex")) {
+        if (codexAuthProblem(ctx, dst_dir)) |problem|
+            die(ctx, "codex login did not write refresh-capable device auth under '{s}' ({s})", .{ dst_dir, problem });
+    }
 }
 
 /// Store a Claude metadata artifact with only selected oauthAccount fields.
@@ -1588,7 +1665,7 @@ fn spawnClaudeLogin(ctx: Context, program: *const Program, login_dir: []const u8
 /// Example: Codex uses `codex login --device-auth`.
 fn runLogin(ctx: Context, program: *const Program, login_dir: []const u8, dst_dir: []const u8) void {
     if (std.mem.eql(u8, program.name, "codex")) {
-        const argv = [_][]const u8{ program.binary, "login", "--device-auth" };
+        const argv = [_][]const u8{ program.binary, "-c", codex_file_auth_override, "login", "--device-auth" };
         return spawnLogin(ctx, program, &argv, login_dir);
     }
     if (std.mem.eql(u8, program.name, "claude")) {
@@ -1619,6 +1696,7 @@ pub fn cmdAdd(ctx: Context, programs: []Program, progname: []const u8, account_k
     var state_buf: [max_auth_tokens]Variant = undefined;
     var st = loadState(ctx, root, &state_buf);
     if (variant_arg == null or !isDefault(variant_arg.?)) captureLiveDefault(ctx, resolved.program.name, root, &st);
+    syncLiveCodexCurrent(ctx, resolved.program.name, root, st);
     if (st.len >= max_auth_tokens)
         die(ctx, "{s} account '{s}' already has the maximum auth tokens one command will load ({d}; disk storage is not limited)", .{
             resolved.program.name,
@@ -1730,6 +1808,7 @@ pub fn cmdRotate(ctx: Context, programs: []Program, progname: []const u8, accoun
     var state_buf: [max_auth_tokens]Variant = undefined;
     var st = loadState(ctx, root, &state_buf);
     captureLiveDefault(ctx, resolved.program.name, root, &st);
+    syncLiveCodexCurrent(ctx, resolved.program.name, root, st);
     if (st.len < 2)
         die(ctx, "{s} account '{s}' needs at least two auth tokens to rotate", .{ resolved.program.name, resolved.account.account });
     const now = nowSecs(ctx);
@@ -1767,6 +1846,7 @@ pub fn cmdRemove(ctx: Context, programs: []Program, progname: []const u8, accoun
     const root = stateRoot(ctx, resolved.program, resolved.account.path);
     var state_buf: [max_auth_tokens]Variant = undefined;
     var st = loadState(ctx, root, &state_buf);
+    syncLiveCodexCurrent(ctx, resolved.program.name, root, st);
     const idx = variantIndex(st, token) orelse
         die(ctx, "{s} account '{s}' has no auth token '{s}'", .{ resolved.program.name, resolved.account.account, token });
     if (st.len == 1)
@@ -1809,6 +1889,7 @@ pub fn cmdCheck(ctx: Context, programs: []Program, progname: []const u8, account
     var state_buf: [max_auth_tokens]Variant = undefined;
     var st = loadState(ctx, root, &state_buf);
     captureLiveDefault(ctx, resolved.program.name, root, &st);
+    syncLiveCodexCurrent(ctx, resolved.program.name, root, st);
     if (st.len == 0)
         die(ctx, "{s} account '{s}' has no auth tokens to check", .{ resolved.program.name, resolved.account.account });
 
@@ -1872,6 +1953,7 @@ pub fn cmdList(ctx: Context, programs: []Program, progname: []const u8, account_
     const root = stateRoot(ctx, resolved.program, resolved.account.path);
     var state_buf: [max_auth_tokens]Variant = undefined;
     const st = loadState(ctx, root, &state_buf);
+    syncLiveCodexCurrent(ctx, resolved.program.name, root, st);
     if (st.len == 0)
         die(ctx, "{s} account '{s}' has no auth tokens", .{ resolved.program.name, resolved.account.account });
 

@@ -140,11 +140,16 @@ cat > "$FAKEBIN/codex" <<'SH'
 b64url() {
   base64 | tr '+/' '-_' | tr -d '=\n'
 }
+raw_args="$*"
+if [ "${1:-}" = -c ]; then
+  test "${2:-}" = cli_auth_credentials_store=file || exit 91
+  shift 2
+fi
 if [ -n "${MA_TEST_LOG:-}" ]; then
   {
     printf 'program=codex\n'
     printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
-    printf 'args=%s\n' "$*"
+    printf 'args=%s\n' "$raw_args"
   } >> "$MA_TEST_LOG"
 fi
 if [ "${1:-}" = login ] && [ "${2:-}" = --device-auth ]; then
@@ -160,7 +165,7 @@ if [ "${1:-}" = login ] && [ "${2:-}" = --device-auth ]; then
     token_id="$variant"
   fi
   payload="$(printf '{"email":"%s","sub":"acct-%s"}' "$user" "$token_id" | b64url)"
-  printf '{"auth_mode":"chatgpt","kind":"subscription","variant":"%s","tokens":{"id_token":"%s.%s.","refresh_token":"refresh-%s","account_id":"acct-%s"}}\n' "$variant" "$header" "$payload" "$token_id" "$token_id" \
+  printf '{"auth_mode":"chatgpt","kind":"subscription","variant":"%s","tokens":{"id_token":"%s.%s.sig","refresh_token":"refresh-%s","account_id":"acct-%s"}}\n' "$variant" "$header" "$payload" "$token_id" "$token_id" \
     > "$CODEX_HOME/auth.json"
 fi
 if [ "${1:-}" = login ] && [ "${2:-}" = status ]; then
@@ -181,6 +186,10 @@ if [ "${1:-}" = exec ]; then
     exit 0
   fi
   test -f "$CODEX_HOME/auth.json" || exit 1
+  if [ -n "${MA_TEST_CODEX_REFRESH_MARK:-}" ]; then
+    old="$(cat "$CODEX_HOME/auth.json")"
+    printf '%s\n' "$old" | sed "s/}$/,\"refresh_mark\":\"$MA_TEST_CODEX_REFRESH_MARK\"}/" > "$CODEX_HOME/auth.json"
+  fi
   printf 'pong\n'
 fi
 SH
@@ -335,7 +344,7 @@ run_ma_logged auth add codex cn sub1 >/dev/null
 assert_file "$ROOT/codex-2-cn/.codex/ma-auth/sub1/auth.json"
 assert_file "$ROOT/codex-2-cn/.codex/auth.json"
 assert_grep "$LOG" "CODEX_HOME=$ROOT/codex-2-cn/.codex/ma-auth/sub1"
-assert_grep "$LOG" "args=login --device-auth"
+assert_grep "$LOG" "args=-c cli_auth_credentials_store=file login --device-auth"
 run_ma_logged auth add codex cn sub2 >/dev/null
 if ( MA_TEST_CODEX_TOKEN=sub1 run_ma_logged auth add codex cn subdup ) > "$CASE/codex-dup.out" 2> "$CASE/codex-dup.err"; then
   die "expected duplicate Codex token add to fail"
@@ -346,17 +355,29 @@ run_ma auth rotate codex cn >/dev/null
 assert_grep "$ROOT/codex-2-cn/.codex/auth.json" '"variant":"sub2"'
 run_ma auth rotate codex cn >/dev/null
 assert_grep "$ROOT/codex-2-cn/.codex/auth.json" '"variant":"sub1"'
+MA_TEST_CODEX_REFRESH_MARK=live-run run_ma_logged codex cn exec hi >/dev/null
+unset MA_TEST_CODEX_REFRESH_MARK
+assert_grep "$LOG" "args=-c cli_auth_credentials_store=file exec hi"
+assert_grep "$ROOT/codex-2-cn/.codex/ma-auth/sub1/auth.json" '"refresh_mark":"live-run"'
+if run_ma codex cn exec -c cli_auth_credentials_store=keyring hi > "$CASE/codex-user-auth-store.out" 2> "$CASE/codex-user-auth-store.err"; then
+  die "expected managed Codex auth storage override to fail"
+fi
+assert_grep "$CASE/codex-user-auth-store.err" "managed Codex auth requires cli_auth_credentials_store=file"
+if run_ma codex cn --config=cli_auth_credentials_store=keyring exec hi > "$CASE/codex-user-auth-store-inline.out" 2> "$CASE/codex-user-auth-store-inline.err"; then
+  die "expected inline managed Codex auth storage override to fail"
+fi
+assert_grep "$CASE/codex-user-auth-store-inline.err" "managed Codex auth requires cli_auth_credentials_store=file"
 if run_ma auth rotate codex cn > "$CASE/codex-rotate.out" 2> "$CASE/codex-rotate.err"; then
   die "expected rapid Codex rotation warning"
 fi
 assert_grep "$CASE/codex-rotate.err" "all codex auth tokens"
 run_ma_logged auth check codex cn > "$CASE/codex-check.out"
 assert_grep "$CASE/codex-check.out" "ok"
-assert_grep "$LOG" "args=exec --ephemeral --skip-git-repo-check --ignore-rules --ignore-user-config --sandbox read-only Reply exactly with the single word: pong"
+assert_grep "$LOG" "args=-c cli_auth_credentials_store=file exec --ephemeral --skip-git-repo-check --ignore-rules --ignore-user-config --sandbox read-only Reply exactly with the single word: pong"
 run_ma auth ls codex cn > "$CASE/codex-ls.out"
 assert_grep "$CASE/codex-ls.out" "auth tokens"
 assert_grep "$CASE/codex-ls.out" "*   sub1"
-assert_grep "$CASE/codex-ls.out" "sub1@example.test"
+assert_grep "$CASE/codex-ls.out" "sub2@example.test"
 mkdir -p "$ROOT/codex-2-cn/.codex/ma-auth/deadping"
 printf '{"kind":"subscription","variant":"deadping","tokens":{"refresh_token":"refresh-deadping","account_id":"acct-deadping"}}\n' > "$ROOT/codex-2-cn/.codex/ma-auth/deadping/auth.json"
 printf 'variant\tdeadping\t0\t0\tlogin\n' >> "$ROOT/codex-2-cn/.codex/ma-auth/state.tsv"
@@ -381,12 +402,12 @@ assert_grep "$CASE/codex-prune.out" "pruned"
 assert_file "$ROOT/codex-2-cn/.codex/ma-auth/deadping/auth.json"
 assert_file "$ROOT/codex-2-cn/.codex/ma-auth/limited/auth.json"
 assert_no_file "$ROOT/codex-2-cn/.codex/ma-auth/broken/auth.json"
-assert_grep "$ROOT/codex-2-cn/.codex/auth.json" '"variant":"sub1"'
+assert_file "$ROOT/codex-2-cn/.codex/auth.json"
 run_ma auth remove codex cn deadping >/dev/null
 run_ma auth remove codex cn limited >/dev/null
 run_ma auth remove codex cn sub2 >/dev/null
 assert_no_file "$ROOT/codex-2-cn/.codex/ma-auth/sub2/auth.json"
-assert_grep "$ROOT/codex-2-cn/.codex/auth.json" '"variant":"sub1"'
+assert_file "$ROOT/codex-2-cn/.codex/auth.json"
 if run_ma auth remove codex cn sub1 > "$CASE/codex-remove-last.out" 2> "$CASE/codex-remove-last.err"; then
   die "expected removing the last Codex token to require clear"
 fi

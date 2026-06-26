@@ -175,6 +175,13 @@ the underlying tool to validate each stored login, then makes a small non-intera
 provider ping. It reports `ok`, `limit`, `bad`, or `unk`; with `--prune`, only clearly
 invalid auth (`bad`) is removed from `ma-auth/`. Quota-limited and inconclusive logins are
 kept and are printed as `kept`.
+
+The stored login is refresh-capable, but the live OAuth access token inside it is still
+short-lived. If a slot has been idle for a while, run a tiny command through that account so
+the real CLI can refresh it, for example `ma claude work -p hi` or
+`ma codex work exec --skip-git-repo-check hi`. `ma auth check` also exercises the saved
+logins this way.
+
 Claude token metadata is saved as a sanitized `.claude.json` artifact with selected
 OAuth account fields only. Rotation writes only those selected `oauthAccount` fields and
 the selected `.credentials.json` back to the shared `.claude/` directory; other Claude

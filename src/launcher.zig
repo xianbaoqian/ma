@@ -113,6 +113,43 @@ fn exec(argv: []const []const u8) noreturn {
 
 // ---- KERNEL ----
 
+/// Return whether a Codex -c value tries to control CLI auth storage.
+/// Example: "cli_auth_credentials_store=keyring" is rejected for managed auth.
+fn isCodexAuthStoreOverrideValue(arg: []const u8) bool {
+    const key = "cli_auth_credentials_store";
+    if (!std.mem.startsWith(u8, arg, key)) return false;
+    return arg.len == key.len or arg[key.len] == '=';
+}
+
+/// Return whether an argv item contains a Codex config override for auth storage.
+/// Example: "--config=cli_auth_credentials_store=keyring" returns true.
+fn isInlineCodexAuthStoreOverride(arg: []const u8) bool {
+    if (std.mem.startsWith(u8, arg, "--config="))
+        return isCodexAuthStoreOverrideValue(arg["--config=".len..]);
+    if (std.mem.startsWith(u8, arg, "-c="))
+        return isCodexAuthStoreOverrideValue(arg["-c=".len..]);
+    if (std.mem.startsWith(u8, arg, "-c") and arg.len > 2)
+        return isCodexAuthStoreOverrideValue(arg[2..]);
+    return false;
+}
+
+/// Reject user overrides that would move Codex refreshes away from the selected slot.
+/// Example: `ma codex work exec -c cli_auth_credentials_store=keyring hi` fails early.
+fn rejectCodexAuthStoreOverride(args: [][]const u8) void {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            if (i + 1 < args.len and isCodexAuthStoreOverrideValue(args[i + 1]))
+                fail("managed Codex auth requires cli_auth_credentials_store=file; remove the user -c override", .{});
+            i += 1;
+            continue;
+        }
+        if (isInlineCodexAuthStoreOverride(arg))
+            fail("managed Codex auth requires cli_auth_credentials_store=file; remove the user -c override", .{});
+    }
+}
+
 /// Launch one account by deriving PROGRAM-ID-ACCOUNT from the symlink path.
 /// Example: argv0="/accounts/claude-1-work/claude" sets CLAUDE_CONFIG_DIR and execs claude.
 fn launch(programs: []Program, args: [][]const u8, argv0: []const u8, arg0base: []const u8) noreturn {
@@ -131,16 +168,30 @@ fn launch(programs: []Program, args: [][]const u8, argv0: []const u8, arg0base: 
 
     for (p.program.pairs) |pair|
         env.put(pair.name, join(&.{ folder, pair.dir })) catch fail("static workspace exhausted", .{});
+    const force_codex_file_auth = auth_mod.launchNeedsCodexFileAuthOverride(.{ .io = io, .gpa = gpa, .env = env, .install_root = root }, p.program, folder);
+    if (force_codex_file_auth) rejectCodexAuthStoreOverride(args);
     auth_mod.applyLaunchEnv(.{ .io = io, .gpa = gpa, .env = env, .install_root = root }, p.program, folder);
 
     const real = which(p.program.binary, folder) orelse
         fail("binary '{s}' not found in PATH", .{p.program.binary});
 
-    if (args.len > max_exec_args) fail("too many command arguments for one request (max {d})", .{max_exec_args});
+    const extra_args: usize = if (force_codex_file_auth) 2 else 0;
+    if (args.len + extra_args > max_exec_args) fail("too many command arguments for one request (max {d})", .{max_exec_args});
     var argv_buf: [max_exec_args][]const u8 = undefined;
-    argv_buf[0] = real;
-    for (args[1..], 1..) |a, i| argv_buf[i] = a;
-    exec(argv_buf[0..args.len]);
+    var argc: usize = 0;
+    argv_buf[argc] = real;
+    argc += 1;
+    if (force_codex_file_auth) {
+        argv_buf[argc] = "-c";
+        argc += 1;
+        argv_buf[argc] = auth_mod.codex_file_auth_override;
+        argc += 1;
+    }
+    for (args[1..]) |a| {
+        argv_buf[argc] = a;
+        argc += 1;
+    }
+    exec(argv_buf[0..argc]);
 }
 
 // ---- ADD-ONS ----
