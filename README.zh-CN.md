@@ -160,7 +160,8 @@ ma auth rotate claude work
 保存下来的登录可以刷新，但里面真正拿去请求服务端的 OAuth access token 还是短期有效的。某个
 登录放久了以后，可以让对应工具跑一个很小的命令，顺手把 token 刷新掉，比如
 `ma claude work -p hi`，或者 `ma codex work exec --skip-git-repo-check hi`。`ma auth check`
-也会用这种方式实际试一下保存的登录。
+也会用这种方式实际试一下保存的登录，所以可能会刷新 `ma-auth/<token>/` 下面的 token 文件。
+`state.tsv` 只记当前用哪一个、什么时候添加和轮换，不存 OAuth token。
 
 文件都放在这个账号自己的状态目录里。Codex 的登录保存成 `ma-auth/<name>/auth.json`。Claude 的
 登录保存成 `ma-auth/<name>/.credentials.json`，启动 Claude 时 `ma` 会让 Claude 使用当前选中的

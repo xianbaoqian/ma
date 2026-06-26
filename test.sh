@@ -371,8 +371,10 @@ if run_ma auth rotate codex cn > "$CASE/codex-rotate.out" 2> "$CASE/codex-rotate
   die "expected rapid Codex rotation warning"
 fi
 assert_grep "$CASE/codex-rotate.err" "all codex auth tokens"
-run_ma_logged auth check codex cn > "$CASE/codex-check.out"
+run_ma_logged auth check codex cn > "$CASE/codex-check.out" 2> "$CASE/codex-check.err"
 assert_grep "$CASE/codex-check.out" "ok"
+assert_grep "$CASE/codex-check.err" "auth check runs real codex status/ping calls"
+assert_grep "$CASE/codex-check.err" "ma-auth/<token>/auth.json"
 assert_grep "$LOG" "args=-c cli_auth_credentials_store=file exec --ephemeral --skip-git-repo-check --ignore-rules --ignore-user-config --sandbox read-only Reply exactly with the single word: pong"
 run_ma auth ls codex cn > "$CASE/codex-ls.out"
 assert_grep "$CASE/codex-ls.out" "auth tokens"
@@ -450,8 +452,10 @@ assert_grep "$LOG" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROOT/claude-1-cn/.claude/ma
 assert_grep "$ROOT/claude-1-cn/.claude/.credentials.json" '"refreshToken":"refresh-csub2"'
 assert_grep "$ROOT/claude-1-cn/.claude/.claude.json" "csub2@example.test"
 assert_grep "$ROOT/claude-1-cn/.claude/settings.json" '"theme":"stable"'
-run_ma_logged auth check claude cn > "$CASE/claude-check.out"
+run_ma_logged auth check claude cn > "$CASE/claude-check.out" 2> "$CASE/claude-check.err"
 assert_grep "$CASE/claude-check.out" "ok"
+assert_grep "$CASE/claude-check.err" "auth check runs real claude status/ping calls"
+assert_grep "$CASE/claude-check.err" "ma-auth/<token>/.credentials.json"
 assert_grep "$LOG" "PATH=$ROOT/claude-1-cn/.claude/ma-auth/.ma-file-auth-bin:"
 assert_grep "$LOG" "args=--safe-mode --no-session-persistence --output-format text --permission-mode dontAsk --tools  -p Reply exactly with the single word: pong"
 assert_grep "$ROOT/claude-1-cn/.claude/ma-auth/.ma-file-auth-bin/security.log" "find-generic-password"

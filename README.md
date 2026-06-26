@@ -180,7 +180,8 @@ The stored login is refresh-capable, but the live OAuth access token inside it i
 short-lived. If a slot has been idle for a while, run a tiny command through that account so
 the real CLI can refresh it, for example `ma claude work -p hi` or
 `ma codex work exec --skip-git-repo-check hi`. `ma auth check` also exercises the saved
-logins this way.
+logins this way, so it may refresh token files under `ma-auth/<token>/`. `state.tsv` stores
+only the current token name and add/rotate times, not OAuth tokens.
 
 Claude token metadata is saved as a sanitized `.claude.json` artifact with selected
 OAuth account fields only. Rotation writes only those selected `oauthAccount` fields and

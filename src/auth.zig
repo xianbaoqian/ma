@@ -1567,6 +1567,14 @@ fn installCurrentOrClear(ctx: Context, program: []const u8, root: []const u8, st
     for (artifacts(program)) |name| removeFile(ctx, join(ctx, &.{ root, name }));
 }
 
+/// Return the token artifact that provider refreshes may update during auth check.
+/// Example: Codex refreshes ma-auth/<token>/auth.json.
+fn refreshArtifactName(program: []const u8) []const u8 {
+    if (std.mem.eql(u8, program, "claude")) return ".credentials.json";
+    if (std.mem.eql(u8, program, "codex")) return "auth.json";
+    return "auth";
+}
+
 /// Return a local fingerprint for one auth token slot.
 /// Example: Claude shows token:abc123; Codex shows auth:<file-digest>.
 fn variantFingerprint(ctx: Context, program: []const u8, variant_dir: []const u8) []const u8 {
@@ -1954,6 +1962,11 @@ pub fn cmdCheck(ctx: Context, programs: []Program, progname: []const u8, account
     if (st.len == 0) {
         die(ctx, "{s} account '{s}' has no auth tokens to check", .{ resolved.program.name, resolved.account.account });
     }
+
+    warn(ctx, "auth check runs real {s} status/ping calls for each token; this can consume a small request and may refresh OAuth into ma-auth/<token>/{s}", .{
+        resolved.program.name,
+        refreshArtifactName(resolved.program.name),
+    });
 
     var i: usize = 0;
     var failed: usize = 0;
